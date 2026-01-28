@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  wallet:
+    build: .
+    container_name: kekius_wallet
+    ports:
+      - "8003:8003"
+    environment:
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - SOLANA_WS_URL=${SOLANA_WS_URL:-wss://api.mainnet-beta.solana.com}
+      - WALLET_PRIVATE_KEY=${WALLET_PRIVATE_KEY}
+      - COLD_WALLET_ADDRESS=${COLD_WALLET_ADDRESS}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEFAULT_SLIPPAGE_BPS=${DEFAULT_SLIPPAGE_BPS:-100}
+      - DEFAULT_SPEED_MODE=${DEFAULT_SPEED_MODE:-ULTRA_FAST}
+      - ENABLE_AUTO_PROFIT_CONVERSION=${ENABLE_AUTO_PROFIT_CONVERSION:-true}
+      - PROFIT_THRESHOLD_SOL=${PROFIT_THRESHOLD_SOL:-0.1}
+      - AUTO_TRANSFER_TO_COLD_WALLET=${AUTO_TRANSFER_TO_COLD_WALLET:-true}
+      - TRANSFER_THRESHOLD_USDC=${TRANSFER_THRESHOLD_USDC:-10.0}
+    restart: unless-stopped
+    networks:
+      - kekius-network
+
+networks:
+  kekius-network:
+    external: true
