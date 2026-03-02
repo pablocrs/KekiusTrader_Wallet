@@ -16,6 +16,7 @@ class TradingEngine:
         self.wallet = wallet
         self.jupiter = JupiterClient()
         self.initial_sol_balance: Optional[float] = None
+        self._background_tasks = set()
         
     async def initialize(self):
         """Initialize trading engine"""
@@ -27,6 +28,9 @@ class TradingEngine:
     
     async def close(self):
         """Close trading engine"""
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         await self.jupiter.close()
     
     async def buy(
@@ -249,7 +253,10 @@ class TradingEngine:
                 logger.info(f"✅ SELL confirmed on attempt {attempt}: {signature}")
 
                 # Trigger profit conversion after successful sell
-                asyncio.create_task(self.convert_profit_to_usdc())
+                self._schedule_background_task(
+                    self.convert_profit_to_usdc(),
+                    "convert_profit_to_usdc",
+                )
 
                 return result
 
@@ -327,6 +334,10 @@ class TradingEngine:
             
             # Calculate profit
             current_balance = await self.wallet.get_sol_balance(use_cache=False)
+            if self.initial_sol_balance is None:
+                self.initial_sol_balance = current_balance
+                return None
+
             profit_sol = current_balance - self.initial_sol_balance
             
             if profit_sol < settings.PROFIT_THRESHOLD_SOL:
@@ -343,19 +354,100 @@ class TradingEngine:
                 speed_mode="BALANCED"  # Don't need ultra fast for profit taking
             )
             
-            if result:
+            if result and result.get("success", False):
                 # Reset profit baseline
                 self.initial_sol_balance = await self.wallet.get_sol_balance(use_cache=False)
                 logger.info("✅ Profit converted to USDC")
                 
                 # Trigger cold wallet transfer check
-                asyncio.create_task(self._check_cold_wallet_transfer())
+                self._schedule_background_task(
+                    self._check_cold_wallet_transfer(),
+                    "check_cold_wallet_transfer",
+                )
             
             return result
             
         except Exception as e:
             logger.error(f"Error converting profit to USDC: {e}")
             return None
+
+    async def convert_sol_to_usdc(
+        self,
+        amount_sol: Optional[float] = None,
+        min_reserve_sol: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convert SOL balance to USDC.
+
+        If amount_sol is omitted, converts all SOL above min_reserve_sol.
+        """
+        try:
+            reserve_sol = settings.SOL_TO_USDC_MIN_RESERVE_SOL if min_reserve_sol is None else float(min_reserve_sol)
+            reserve_sol = max(0.0, reserve_sol)
+
+            current_balance = await self.wallet.get_sol_balance(use_cache=False)
+            if amount_sol is None:
+                convert_amount_sol = max(0.0, current_balance - reserve_sol)
+            else:
+                convert_amount_sol = float(amount_sol)
+                if convert_amount_sol <= 0:
+                    return {"success": False, "error": "amount_sol must be > 0"}
+                if current_balance - convert_amount_sol < reserve_sol:
+                    return {
+                        "success": False,
+                        "error": "insufficient SOL after reserve",
+                        "balance_sol": current_balance,
+                        "requested_amount_sol": convert_amount_sol,
+                        "min_reserve_sol": reserve_sol,
+                    }
+
+            if convert_amount_sol <= 0:
+                return {
+                    "success": False,
+                    "error": "no SOL available above reserve",
+                    "balance_sol": current_balance,
+                    "min_reserve_sol": reserve_sol,
+                }
+
+            logger.info(
+                f"💱 Converting SOL balance to USDC: {convert_amount_sol:.6f} SOL (reserve {reserve_sol:.6f})"
+            )
+            result = await self.buy(
+                mint=settings.USDC_MINT,
+                amount_sol=convert_amount_sol,
+                slippage_bps=50,
+                speed_mode="BALANCED",
+            )
+
+            if result and result.get("success", False):
+                self.initial_sol_balance = await self.wallet.get_sol_balance(use_cache=False)
+                self._schedule_background_task(
+                    self._check_cold_wallet_transfer(),
+                    "check_cold_wallet_transfer",
+                )
+                result["converted_amount_sol"] = convert_amount_sol
+                result["min_reserve_sol"] = reserve_sol
+                return result
+
+            return result or {"success": False, "error": "conversion failed"}
+        except Exception as e:
+            logger.error(f"Error converting SOL to USDC: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _schedule_background_task(self, coro, name: str) -> None:
+        """Create tracked background tasks with exception logging."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+
+        def _done_callback(done_task):
+            self._background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error(f"Background task '{name}' failed: {exc}")
+
+        task.add_done_callback(_done_callback)
     
     async def _wait_for_confirmation(self, signature: str, timeout: int = 30) -> bool:
         """Wait for transaction confirmation with timeout"""

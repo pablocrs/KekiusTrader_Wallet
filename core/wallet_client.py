@@ -14,6 +14,25 @@ from datetime import datetime
 import aiohttp
 import json
 
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True if the exception is HTTP 429 Too Many Requests (RPC rate limit)."""
+    if exc is None:
+        return False
+    if httpx and isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    if "429" in str(exc) or "Too Many Requests" in str(exc):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        return _is_rate_limit_error(cause)
+    return False
+
 # Solana native mint (SOL)
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
@@ -131,27 +150,45 @@ class WalletClient:
                 rpc_uri = getattr(rpc_endpoint, 'endpoint_uri', 'Unknown')
                 logger.info(f"Using RPC: {rpc_uri}")
             
-            try:
-                logger.info(f"📡 Calling get_token_accounts_by_owner for wallet {wallet_addr}...")
-                response = await self.client.get_token_accounts_by_owner(
-                    self.public_key,
-                    TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"))
-                )
-                
-                logger.info(f"✅ RPC call successful")
-                
-                if response.value is None:
-                    logger.warning("⚠️ RPC returned None for token accounts")
+            response = None
+            last_error = None
+            max_retries = 2
+            retry_delays = [1.0, 2.0]
+            for attempt in range(max_retries + 1):
+                try:
+                    logger.info(f"📡 Calling get_token_accounts_by_owner for wallet {wallet_addr}...")
+                    response = await self.client.get_token_accounts_by_owner(
+                        self.public_key,
+                        TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"))
+                    )
+                    logger.info(f"✅ RPC call successful")
+                    break
+                except Exception as e:
+                    last_error = e
+                    if _is_rate_limit_error(e) and attempt < max_retries:
+                        delay = retry_delays[attempt]
+                        logger.warning(f"⚠️ RPC rate limited (429), retry in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+                        await asyncio.sleep(delay)
+                        continue
+                    if _is_rate_limit_error(e):
+                        logger.error("❌ RPC rate limited (429) after retries. Use a paid RPC (SOLANA_RPC_URL) to avoid this.")
+                        if self._token_accounts_cache:
+                            logger.warning("📦 Returning cached token accounts due to rate limit")
+                            return self._token_accounts_cache
+                        return []
+                    logger.error(f"❌ RPC call failed: {type(e).__name__}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     return []
-                
-                logger.info(f"📦 RPC returned {len(response.value)} raw token account(s)")
-            except Exception as e:
-                logger.error(f"❌ RPC call failed: {type(e).__name__}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                # Don't return empty list on error - let the caller know there was an error
-                # But for now, return empty to prevent crashes
+            
+            if response is None:
                 return []
+            
+            if response.value is None:
+                logger.warning("⚠️ RPC returned None for token accounts")
+                return []
+            
+            logger.info(f"📦 RPC returned {len(response.value)} raw token account(s)")
             
             token_accounts = []
             
@@ -234,7 +271,14 @@ class WalletClient:
                             # This ensures tokens are always added even if metadata fetch fails
                             if symbol == "UNK" or name == "Unknown Token":
                                 # Fetch metadata in background for next time
-                                asyncio.create_task(self.get_token_metadata(mint_str))
+                                metadata_task = asyncio.create_task(self.get_token_metadata(mint_str))
+                                metadata_task.add_done_callback(
+                                    lambda t, m=mint_str: (
+                                        None if t.cancelled() else
+                                        logger.debug(f"Metadata fetch failed for {m[:8]}...: {t.exception()}")
+                                        if t.exception() else None
+                                    )
+                                )
                                 logger.debug(f"📡 Queued metadata fetch for {mint_str[:8]}... (will update on next refresh)")
                             
                             # Use mint address as symbol if metadata not available yet
@@ -437,14 +481,16 @@ class WalletClient:
         try:
             logger.debug(f"Waiting for confirmation: {signature}")
             
-            start_time = asyncio.get_event_loop().time()
+            loop = asyncio.get_running_loop()
+            start_time = loop.time()
             
-            while asyncio.get_event_loop().time() - start_time < timeout:
+            while loop.time() - start_time < timeout:
                 response = await self.client.get_signature_statuses([signature])
                 
                 if response.value and response.value[0]:
                     status = response.value[0]
-                    if status.confirmation_status in ["confirmed", "finalized"]:
+                    confirmation_status = str(status.confirmation_status).lower()
+                    if confirmation_status in ["confirmed", "finalized"]:
                         logger.info(f"✅ Transaction confirmed: {signature}")
                         return True
                     elif status.err:

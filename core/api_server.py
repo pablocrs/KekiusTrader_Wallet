@@ -25,6 +25,20 @@ class SellAllRequest(BaseModel):
     slippage_bps: Optional[int] = Field(None, ge=0, le=10000, description="Slippage in basis points")
     speed_mode: Optional[str] = Field(None, description="Speed mode")
 
+
+class ConvertSolRequest(BaseModel):
+    """SOL to USDC conversion request"""
+    amount_sol: Optional[float] = Field(
+        None,
+        gt=0,
+        description="Exact SOL amount to convert. If omitted, converts all SOL above min_reserve_sol.",
+    )
+    min_reserve_sol: Optional[float] = Field(
+        None,
+        ge=0,
+        description="Minimum SOL to keep in wallet when amount_sol is omitted.",
+    )
+
 class ApiServer:
     """
     REST API server for wallet operations.
@@ -50,10 +64,18 @@ class ApiServer:
     
     def setup_cors(self):
         """Configure CORS"""
+        allow_origins = ["*"]
+        allow_credentials = False
+
+        # CORS spec forbids wildcard origins when credentials are enabled.
+        if settings.CORS_ALLOWED_ORIGINS:
+            allow_origins = settings.CORS_ALLOWED_ORIGINS
+            allow_credentials = "*" not in allow_origins
+
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
+            allow_origins=allow_origins,
+            allow_credentials=allow_credentials,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -91,8 +113,9 @@ class ApiServer:
                     speed_mode=request.speed_mode
                 )
                 
-                if not result:
-                    raise HTTPException(status_code=500, detail="Buy operation failed")
+                if not result or not result.get("success", False):
+                    error_message = (result or {}).get("error", "Buy operation failed")
+                    raise HTTPException(status_code=500, detail=error_message)
                 
                 return {
                     "success": True,
@@ -100,6 +123,8 @@ class ApiServer:
                     "message": f"Buy order submitted. Signature: {result['signature']}"
                 }
                 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"API error in /buy: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -121,8 +146,9 @@ class ApiServer:
                     speed_mode=request.speed_mode
                 )
                 
-                if not result:
-                    raise HTTPException(status_code=500, detail="Sell operation failed")
+                if not result or not result.get("success", False):
+                    error_message = (result or {}).get("error", "Sell operation failed")
+                    raise HTTPException(status_code=500, detail=error_message)
                 
                 return {
                     "success": True,
@@ -130,6 +156,8 @@ class ApiServer:
                     "message": f"Sell order submitted. Signature: {result['signature']}"
                 }
                 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"API error in /sell: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -155,6 +183,9 @@ class ApiServer:
                         status_code=400,
                         detail="Sell-all operation failed (possibly no balance)"
                     )
+                if not result.get("success", False):
+                    error_message = result.get("error", "Sell-all operation failed")
+                    raise HTTPException(status_code=500, detail=error_message)
                 
                 return {
                     "success": True,
@@ -162,6 +193,8 @@ class ApiServer:
                     "message": f"Sell-all order submitted. Signature: {result['signature']}"
                 }
                 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"API error in /sell-all: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -241,4 +274,33 @@ class ApiServer:
                 }
             except Exception as e:
                 logger.error(f"API error in /profit/convert: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/convert/sol-to-usdc")
+        async def convert_sol_balance(request: ConvertSolRequest):
+            """
+            Convert SOL balance to USDC.
+
+            - With amount_sol: converts exact SOL amount.
+            - Without amount_sol: converts all SOL above min_reserve_sol.
+            """
+            try:
+                result = await self.trading_engine.convert_sol_to_usdc(
+                    amount_sol=request.amount_sol,
+                    min_reserve_sol=request.min_reserve_sol,
+                )
+
+                if not result or not result.get("success", False):
+                    detail = (result or {}).get("error", "Conversion failed")
+                    raise HTTPException(status_code=400, detail=detail)
+
+                return {
+                    "success": True,
+                    "data": result,
+                    "message": "SOL to USDC conversion initiated",
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"API error in /convert/sol-to-usdc: {e}")
                 raise HTTPException(status_code=500, detail=str(e))

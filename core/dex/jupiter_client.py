@@ -15,18 +15,25 @@ class JupiterClient:
     def __init__(self):
         self.api_url = settings.JUPITER_API_URL
         self.session: Optional[aiohttp.ClientSession] = None
+        self.request_timeout = aiohttp.ClientTimeout(total=settings.JUPITER_HTTP_TIMEOUT_SECONDS)
     
     async def initialize(self):
         """Initialize HTTP session"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=self.request_timeout)
             logger.info("🪐 Jupiter client initialized")
     
     async def close(self):
         """Close HTTP session"""
         if self.session:
             await self.session.close()
+            self.session = None
             logger.info("Jupiter client closed")
+
+    async def _ensure_session(self):
+        """Ensure HTTP client session is initialized and open."""
+        if not self.session or self.session.closed:
+            await self.initialize()
     
     async def get_quote(
         self,
@@ -48,6 +55,7 @@ class JupiterClient:
             Quote data with route information
         """
         try:
+            await self._ensure_session()
             url = f"{self.api_url}/quote"
             params = {
                 "inputMint": input_mint,
@@ -92,6 +100,7 @@ class JupiterClient:
             Base64 encoded transaction
         """
         try:
+            await self._ensure_session()
             url = f"{self.api_url}/swap"
             
             payload = {

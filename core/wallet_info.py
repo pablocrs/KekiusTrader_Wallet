@@ -1,8 +1,9 @@
 from core.wallet_client import WalletClient
 from loguru import logger
-from typing import Dict, Any, List
+from typing import Dict, Any
 from config import settings
 from datetime import datetime
+
 
 class WalletInfo:
     """
@@ -58,7 +59,7 @@ class WalletInfo:
                 try:
                     # Parse token account data
                     account_pubkey = account.get("pubkey", "")
-                    account_data = account.get("data")
+
                     
                     # Extract token info from account data
                     mint = account.get("mint", "Unknown")

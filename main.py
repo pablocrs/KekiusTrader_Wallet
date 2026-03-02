@@ -10,8 +10,11 @@ async def main():
     
     # Handle signals
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(engine.stop()))
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(engine.stop()))
+    except (NotImplementedError, RuntimeError):
+        logger.warning("Signal handlers are not available in this runtime")
     
     try:
         await engine.start()
