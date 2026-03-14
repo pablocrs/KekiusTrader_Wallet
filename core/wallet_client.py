@@ -68,8 +68,9 @@ class WalletClient:
         
         # Cache
         self._balance_cache: Dict[str, Any] = {}
+        self._balance_cache_timestamp: float = 0
         self._token_accounts_cache: Optional[List[Dict]] = None
-        self._cache_timestamp: float = 0
+        self._token_accounts_cache_timestamp: float = 0
         self._token_metadata_cache: Dict[str, Dict[str, Any]] = {}  # mint -> {symbol, name}
     
     async def connect(self):
@@ -97,7 +98,7 @@ class WalletClient:
         try:
             # Check cache
             if use_cache and "SOL" in self._balance_cache:
-                cache_age = datetime.now().timestamp() - self._cache_timestamp
+                cache_age = datetime.now().timestamp() - self._balance_cache_timestamp
                 if cache_age < settings.WALLET_BALANCE_CACHE_TTL:
                     return self._balance_cache["SOL"]
             
@@ -107,7 +108,7 @@ class WalletClient:
             
             # Update cache
             self._balance_cache["SOL"] = balance_sol
-            self._cache_timestamp = datetime.now().timestamp()
+            self._balance_cache_timestamp = datetime.now().timestamp()
             
             return balance_sol
         except Exception as e:
@@ -127,7 +128,7 @@ class WalletClient:
         try:
             # Check cache - but if force_refresh is True, always fetch fresh data
             if not force_refresh and self._token_accounts_cache:
-                cache_age = datetime.now().timestamp() - self._cache_timestamp
+                cache_age = datetime.now().timestamp() - self._token_accounts_cache_timestamp
                 if cache_age < settings.WALLET_BALANCE_CACHE_TTL:
                     logger.info(f"📦 Using cached token accounts ({len(self._token_accounts_cache)} tokens, age: {cache_age:.1f}s)")
                     return self._token_accounts_cache
@@ -176,16 +177,25 @@ class WalletClient:
                             logger.warning("📦 Returning cached token accounts due to rate limit")
                             return self._token_accounts_cache
                         return []
+                    if self._token_accounts_cache:
+                        logger.warning("📦 Returning cached token accounts due to RPC error")
+                        return self._token_accounts_cache
                     logger.error(f"❌ RPC call failed: {type(e).__name__}: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
                     return []
             
             if response is None:
+                if self._token_accounts_cache:
+                    logger.warning("📦 Returning cached token accounts because RPC response was None")
+                    return self._token_accounts_cache
                 return []
             
             if response.value is None:
                 logger.warning("⚠️ RPC returned None for token accounts")
+                if self._token_accounts_cache:
+                    logger.warning("📦 Returning cached token accounts because RPC response value was None")
+                    return self._token_accounts_cache
                 return []
             
             logger.info(f"📦 RPC returned {len(response.value)} raw token account(s)")
@@ -341,7 +351,7 @@ class WalletClient:
                         logger.error(f"❌ Failed to add fallback entry: {e2}")
             
             self._token_accounts_cache = token_accounts
-            self._cache_timestamp = datetime.now().timestamp()
+            self._token_accounts_cache_timestamp = datetime.now().timestamp()
             
             logger.info(f"✅ Retrieved {len(token_accounts)} token accounts for wallet {self.get_public_key_str()[:8]}...")
             if token_accounts:
@@ -580,5 +590,6 @@ class WalletClient:
         """Clear balance and token account cache"""
         self._balance_cache.clear()
         self._token_accounts_cache = None
-        self._cache_timestamp = 0
+        self._balance_cache_timestamp = 0
+        self._token_accounts_cache_timestamp = 0
         logger.debug("Wallet cache cleared")

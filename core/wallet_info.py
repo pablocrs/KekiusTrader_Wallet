@@ -23,12 +23,12 @@ class WalletInfo:
         """
         try:
             # Get SOL balance
-            sol_balance = await self.wallet.get_sol_balance(use_cache=False)
+            sol_balance = await self.wallet.get_sol_balance(use_cache=True)
             
-            # Get token accounts - ALWAYS force refresh to get latest data
-            logger.info(f"🔄 Fetching token accounts (force_refresh=True)...")
+            # Prefer cached token accounts within TTL to reduce RPC rate-limit failures.
+            logger.info(f"🔄 Fetching token accounts (force_refresh=False)...")
             try:
-                token_accounts = await self.wallet.get_token_accounts(force_refresh=True)
+                token_accounts = await self.wallet.get_token_accounts(force_refresh=False)
                 logger.info(f"📊 Received {len(token_accounts)} token accounts from wallet client")
                 
                 # If we got 0 tokens, log a warning but don't fail
