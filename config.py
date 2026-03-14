@@ -49,8 +49,10 @@ class Settings(BaseSettings):
     
     # Cache Configuration
     TOKEN_METADATA_CACHE_TTL: int = 3600  # 1 hour
-    WALLET_BALANCE_CACHE_TTL: int = 5     # 5 seconds
-    
+    WALLET_BALANCE_CACHE_TTL: int = 20    # seconds
+    TOKEN_ACCOUNTS_CACHE_TTL: int = 30    # seconds
+    RPC_RATE_LIMIT_COOLDOWN_SEC: int = 45 # seconds
+
     # Monitoring
     ENABLE_WEBSOCKET_BROADCAST: bool = True
     PING_INTERVAL: int = 30  # WebSocket ping interval

@@ -72,6 +72,8 @@ class WalletClient:
         self._token_accounts_cache: Optional[List[Dict]] = None
         self._token_accounts_cache_timestamp: float = 0
         self._token_metadata_cache: Dict[str, Dict[str, Any]] = {}  # mint -> {symbol, name}
+        self._token_accounts_rate_limited_until: float = 0
+        self._sol_balance_rate_limited_until: float = 0
     
     async def connect(self):
         """Connect to Solana RPC"""
@@ -96,11 +98,21 @@ class WalletClient:
             Balance in SOL
         """
         try:
+            now_ts = datetime.now().timestamp()
+            balance_cache_ts = float(getattr(self, "_balance_cache_timestamp", 0) or 0)
             # Check cache
             if use_cache and "SOL" in self._balance_cache:
-                cache_age = datetime.now().timestamp() - self._balance_cache_timestamp
+                cache_age = now_ts - balance_cache_ts
                 if cache_age < settings.WALLET_BALANCE_CACHE_TTL:
                     return self._balance_cache["SOL"]
+
+            sol_balance_rate_limited_until = float(getattr(self, "_sol_balance_rate_limited_until", 0) or 0)
+            if use_cache and now_ts < sol_balance_rate_limited_until:
+                if "SOL" in self._balance_cache:
+                    return self._balance_cache["SOL"]
+                cooldown = sol_balance_rate_limited_until - now_ts
+                logger.warning(f"⚠️ SOL balance RPC cooldown active for {cooldown:.1f}s; returning 0.0")
+                return 0.0
             
             response = await self.client.get_balance(self.public_key)
             balance_lamports = response.value
@@ -108,10 +120,17 @@ class WalletClient:
             
             # Update cache
             self._balance_cache["SOL"] = balance_sol
-            self._balance_cache_timestamp = datetime.now().timestamp()
+            self._balance_cache_timestamp = now_ts
+            self._sol_balance_rate_limited_until = 0
             
             return balance_sol
         except Exception as e:
+            if _is_rate_limit_error(e):
+                now_ts = datetime.now().timestamp()
+                self._sol_balance_rate_limited_until = now_ts + max(1, int(settings.RPC_RATE_LIMIT_COOLDOWN_SEC))
+                if "SOL" in self._balance_cache:
+                    logger.warning("⚠️ SOL balance RPC rate-limited; returning cached balance")
+                    return self._balance_cache["SOL"]
             logger.error(f"Error getting SOL balance: {e}")
             return 0.0
     
@@ -126,14 +145,29 @@ class WalletClient:
             List of token account info dicts
         """
         try:
+            now_ts = datetime.now().timestamp()
+            token_rate_limited_until = float(getattr(self, "_token_accounts_rate_limited_until", 0) or 0)
+            token_cache_ttl = max(1, int(getattr(settings, "TOKEN_ACCOUNTS_CACHE_TTL", settings.WALLET_BALANCE_CACHE_TTL)))
             # Check cache - but if force_refresh is True, always fetch fresh data
             if not force_refresh and self._token_accounts_cache:
-                cache_age = datetime.now().timestamp() - self._token_accounts_cache_timestamp
-                if cache_age < settings.WALLET_BALANCE_CACHE_TTL:
+                cache_age = now_ts - float(getattr(self, "_token_accounts_cache_timestamp", 0) or 0)
+                if cache_age < token_cache_ttl:
                     logger.info(f"📦 Using cached token accounts ({len(self._token_accounts_cache)} tokens, age: {cache_age:.1f}s)")
                     return self._token_accounts_cache
                 else:
-                    logger.info(f"🔄 Cache expired (age: {cache_age:.1f}s > TTL: {settings.WALLET_BALANCE_CACHE_TTL}s), fetching fresh data")
+                    logger.info(f"🔄 Cache expired (age: {cache_age:.1f}s > TTL: {token_cache_ttl}s), fetching fresh data")
+
+            if now_ts < token_rate_limited_until:
+                if self._token_accounts_cache:
+                    cooldown = token_rate_limited_until - now_ts
+                    logger.warning(
+                        f"⚠️ Token account RPC cooldown active for {cooldown:.1f}s; "
+                        f"serving cache ({len(self._token_accounts_cache)} tokens)"
+                    )
+                    return self._token_accounts_cache
+                cooldown = token_rate_limited_until - now_ts
+                logger.warning(f"⚠️ Token account RPC cooldown active for {cooldown:.1f}s; returning empty list")
+                return []
             
             # from solana.rpc.api import TokenAccountOpts
             from solana.rpc.types import TokenAccountOpts
@@ -160,7 +194,10 @@ class WalletClient:
                     logger.info(f"📡 Calling get_token_accounts_by_owner for wallet {wallet_addr}...")
                     response = await self.client.get_token_accounts_by_owner(
                         self.public_key,
-                        TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"))
+                        TokenAccountOpts(
+                            program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+                            encoding="jsonParsed",
+                        )
                     )
                     logger.info(f"✅ RPC call successful")
                     break
@@ -172,6 +209,9 @@ class WalletClient:
                         await asyncio.sleep(delay)
                         continue
                     if _is_rate_limit_error(e):
+                        self._token_accounts_rate_limited_until = (
+                            datetime.now().timestamp() + max(1, int(settings.RPC_RATE_LIMIT_COOLDOWN_SEC))
+                        )
                         logger.error("❌ RPC rate limited (429) after retries. Use a paid RPC (SOLANA_RPC_URL) to avoid this.")
                         if self._token_accounts_cache:
                             logger.warning("📦 Returning cached token accounts due to rate limit")
@@ -222,107 +262,49 @@ class WalletClient:
                     logger.info(f"🔍 Processing token account {idx + 1}/{len(response.value)}")
                     pubkey = account_info.pubkey
                     account_data = account_info.account.data
+                    data_length = "N/A"
+                    if account_data is not None and isinstance(account_data, (bytes, bytearray, list, tuple, str)):
+                        data_length = len(account_data)
                     logger.info(f"   Account pubkey: {pubkey}")
                     logger.info(f"   Data type: {type(account_data)}")
-                    logger.info(f"   Data length: {len(account_data) if account_data else 'None'}")
-                    
-                    # Parse token account data using SPL token account structure
-                    # Token account structure: [mint(32), owner(32), amount(8), ...]
-                    if account_data and isinstance(account_data, (bytes, list)):
-                        # Convert to bytes if it's a list
-                        if isinstance(account_data, list):
-                            account_data = bytes(account_data)
-                        
-                        if len(account_data) >= 72:
-                            # Extract mint (first 32 bytes)
-                            mint_bytes = account_data[:32]
-                            mint_pubkey = Pubkey.from_bytes(mint_bytes)
-                            
-                            # Extract amount (bytes 64-72)
-                            amount_bytes = account_data[64:72]
-                            amount = int.from_bytes(amount_bytes, byteorder='little')
-                            
-                            # Get token mint info (decimals) - fetch from mint account
-                            decimals = 9  # Default, will try to fetch from mint
-                            try:
-                                mint_info = await self.client.get_account_info(mint_pubkey)
-                                if mint_info.value and mint_info.value.data:
-                                    # Mint account data structure: decimals is at byte 44
-                                    mint_data = mint_info.value.data
-                                    if isinstance(mint_data, (bytes, list)):
-                                        if isinstance(mint_data, list):
-                                            mint_data = bytes(mint_data)
-                                        if len(mint_data) > 44:
-                                            decimals = mint_data[44]
-                            except Exception as e:
-                                logger.debug(f"Could not fetch decimals for {mint_pubkey}: {e}")
-                            
-                            ui_amount = amount / (10 ** decimals) if decimals > 0 else 0
-                            
-                            # Fetch token metadata (symbol, name) - NON-BLOCKING
-                            # Don't let metadata fetching prevent tokens from being added
+                    logger.info(f"   Data length: {data_length}")
+
+                    parsed_info = None
+                    parsed_amount = None
+                    parsed = getattr(account_data, "parsed", None)
+                    if parsed is not None:
+                        parsed_info = getattr(parsed, "info", None)
+                        parsed_amount = getattr(parsed_info, "token_amount", None)
+
+                    mint_str = str(getattr(parsed_info, "mint", "") or "")
+                    amount = int(getattr(parsed_amount, "amount", 0) or 0)
+                    decimals = int(getattr(parsed_amount, "decimals", 9) or 9)
+                    ui_amount = float(getattr(parsed_amount, "ui_amount", 0) or 0)
+
+                    if not mint_str and account_data and isinstance(account_data, (bytes, bytearray, list)):
+                        raw_data = bytes(account_data) if not isinstance(account_data, (bytes, bytearray)) else account_data
+                        if len(raw_data) >= 72:
+                            mint_pubkey = Pubkey.from_bytes(raw_data[:32])
                             mint_str = str(mint_pubkey)
-                            symbol = "UNK"
-                            name = "Unknown Token"
-                            
-                            # Try to get from cache first (fast, synchronous)
-                            try:
-                                if mint_str in self._token_metadata_cache:
-                                    cache_age = datetime.now().timestamp() - self._token_metadata_cache[mint_str].get('_cache_time', 0)
-                                    if cache_age < settings.TOKEN_METADATA_CACHE_TTL:
-                                        cached = self._token_metadata_cache[mint_str]
-                                        symbol = cached.get("symbol", "UNK")
-                                        name = cached.get("name", "Unknown Token")
-                                        logger.debug(f"✅ Using cached metadata for {mint_str[:8]}...: {symbol} ({name})")
-                            except Exception as e:
-                                logger.debug(f"Error reading cache for {mint_str[:8]}...: {e}")
-                            
-                            # If not in cache, fetch in background (don't wait - add token immediately)
-                            # This ensures tokens are always added even if metadata fetch fails
-                            if symbol == "UNK" or name == "Unknown Token":
-                                # Fetch metadata in background for next time
-                                metadata_task = asyncio.create_task(self.get_token_metadata(mint_str))
-                                metadata_task.add_done_callback(
-                                    lambda t, m=mint_str: (
-                                        None if t.cancelled() else
-                                        logger.debug(f"Metadata fetch failed for {m[:8]}...: {t.exception()}")
-                                        if t.exception() else None
-                                    )
-                                )
-                                logger.debug(f"📡 Queued metadata fetch for {mint_str[:8]}... (will update on next refresh)")
-                            
-                            # Use mint address as symbol if metadata not available yet
-                            display_symbol = symbol if symbol and symbol != "UNK" else mint_str[:8]
-                            display_name = name if name and name != "Unknown Token" else f"Token {mint_str[:8]}..."
-                            
-                            token_info = {
-                                "pubkey": str(pubkey),
-                                "mint": mint_str,
-                                "balance": amount,
-                                "ui_amount": ui_amount,
-                                "decimals": decimals,
-                                "symbol": display_symbol,
-                                "name": display_name,
-                                "data": account_data
-                            }
-                            
-                            token_accounts.append(token_info)
-                            logger.info(f"✅ Added token: symbol={display_symbol}, name={display_name}, mint={mint_str[:8]}..., balance={ui_amount}, decimals={decimals}")
-                        else:
-                            # Fallback for accounts without proper data
-                            logger.warning(f"⚠️ Token account {idx + 1} has insufficient data (length: {len(account_data) if account_data else 0})")
-                            token_accounts.append({
-                                "pubkey": str(pubkey),
-                                "mint": "Unknown",
-                                "balance": 0,
-                                "ui_amount": 0,
-                                "decimals": 0,
-                                "symbol": "UNK",
-                                "name": "Unknown Token"
-                            })
-                    else:
-                        # Fallback for accounts without proper data
-                        logger.warning(f"⚠️ Token account {idx + 1} has no data")
+                            amount = int.from_bytes(raw_data[64:72], byteorder='little')
+                            decimals = 9
+                            cached_meta = self._token_metadata_cache.get(mint_str)
+                            if cached_meta and "decimals" in cached_meta:
+                                decimals = int(cached_meta.get("decimals", 9) or 9)
+                            else:
+                                try:
+                                    mint_info = await self.client.get_account_info(mint_pubkey)
+                                    mint_data = getattr(getattr(mint_info, "value", None), "data", None)
+                                    if mint_data and isinstance(mint_data, (bytes, bytearray, list)):
+                                        mint_bytes = bytes(mint_data) if not isinstance(mint_data, (bytes, bytearray)) else mint_data
+                                        if len(mint_bytes) > 44:
+                                            decimals = int(mint_bytes[44])
+                                except Exception as e:
+                                    logger.debug(f"Could not fetch decimals for {mint_str[:8]}...: {e}")
+                            ui_amount = amount / (10 ** decimals) if decimals > 0 else 0
+
+                    if not mint_str:
+                        logger.warning(f"⚠️ Token account {idx + 1} missing parsed mint data")
                         token_accounts.append({
                             "pubkey": str(pubkey),
                             "mint": "Unknown",
@@ -332,6 +314,46 @@ class WalletClient:
                             "symbol": "UNK",
                             "name": "Unknown Token"
                         })
+                        continue
+
+                    symbol = "UNK"
+                    name = "Unknown Token"
+                    try:
+                        if mint_str in self._token_metadata_cache:
+                            cache_age = datetime.now().timestamp() - self._token_metadata_cache[mint_str].get('_cache_time', 0)
+                            if cache_age < settings.TOKEN_METADATA_CACHE_TTL:
+                                cached = self._token_metadata_cache[mint_str]
+                                symbol = cached.get("symbol", "UNK")
+                                name = cached.get("name", "Unknown Token")
+                    except Exception as e:
+                        logger.debug(f"Error reading cache for {mint_str[:8]}...: {e}")
+
+                    if symbol == "UNK" or name == "Unknown Token":
+                        metadata_task = asyncio.create_task(self.get_token_metadata(mint_str))
+                        metadata_task.add_done_callback(
+                            lambda t, m=mint_str: (
+                                None if t.cancelled() else
+                                logger.debug(f"Metadata fetch failed for {m[:8]}...: {t.exception()}")
+                                if t.exception() else None
+                            )
+                        )
+
+                    display_symbol = symbol if symbol and symbol != "UNK" else mint_str[:8]
+                    display_name = name if name and name != "Unknown Token" else f"Token {mint_str[:8]}..."
+
+                    token_info = {
+                        "pubkey": str(pubkey),
+                        "mint": mint_str,
+                        "balance": amount,
+                        "ui_amount": ui_amount,
+                        "decimals": decimals,
+                        "symbol": display_symbol,
+                        "name": display_name,
+                        "data": account_data
+                    }
+
+                    token_accounts.append(token_info)
+                    logger.info(f"✅ Added token: symbol={display_symbol}, name={display_name}, mint={mint_str[:8]}..., balance={ui_amount}, decimals={decimals}")
                 except Exception as e:
                     logger.error(f"❌ Error parsing token account {idx + 1}: {e}")
                     import traceback
@@ -351,7 +373,8 @@ class WalletClient:
                         logger.error(f"❌ Failed to add fallback entry: {e2}")
             
             self._token_accounts_cache = token_accounts
-            self._token_accounts_cache_timestamp = datetime.now().timestamp()
+            self._token_accounts_cache_timestamp = now_ts
+            self._token_accounts_rate_limited_until = 0
             
             logger.info(f"✅ Retrieved {len(token_accounts)} token accounts for wallet {self.get_public_key_str()[:8]}...")
             if token_accounts:
