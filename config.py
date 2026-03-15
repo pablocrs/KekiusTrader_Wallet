@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     
     # DEX Configuration
     DEX_ROUTER: str = "JUPITER"  # JUPITER, RAYDIUM, PUMPFUN
-    JUPITER_API_URL: str = "https://quote-api.jup.ag/v6"
+    JUPITER_API_URL: str = "https://lite-api.jup.ag/swap/v1"
+    JUPITER_API_FALLBACK_URL: str = "https://api.jup.ag/swap/v1"
+    JUPITER_API_KEY: str = ""
+    JUPITER_MAX_RETRIES: int = 5
+    JUPITER_BACKOFF_BASE_SECONDS: float = 0.75
+    JUPITER_BACKOFF_MAX_SECONDS: float = 8.0
     
     # Auto USDC Profit Conversion
     ENABLE_AUTO_PROFIT_CONVERSION: bool = True
@@ -51,6 +56,7 @@ class Settings(BaseSettings):
     
     # Cache Configuration
     TOKEN_METADATA_CACHE_TTL: int = 3600  # 1 hour
+    TOKEN_PRICE_CACHE_TTL: int = 30       # seconds
     WALLET_BALANCE_CACHE_TTL: int = 20    # seconds
     TOKEN_ACCOUNTS_CACHE_TTL: int = 30    # seconds
     RPC_RATE_LIMIT_COOLDOWN_SEC: int = 45 # seconds
@@ -60,5 +66,7 @@ class Settings(BaseSettings):
     PING_INTERVAL: int = 30  # WebSocket ping interval
     CORS_ALLOWED_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
     JUPITER_HTTP_TIMEOUT_SECONDS: int = 30
+    JUPITER_PRICE_API_URL: str = "https://lite-api.jup.ag/price/v3"
+    DEXSCREENER_TOKENS_URL: str = "https://api.dexscreener.com/latest/dex/tokens"
     
 settings = Settings()

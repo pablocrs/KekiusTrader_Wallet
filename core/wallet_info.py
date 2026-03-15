@@ -52,6 +52,19 @@ class WalletInfo:
             }
             
             logger.info(f"📦 Building wallet info: {sol_balance:.4f} SOL, {len(token_accounts)} token accounts")
+
+            price_map: Dict[str, float] = {}
+            try:
+                mints = [
+                    str(account.get("mint", "") or "").strip()
+                    for account in token_accounts
+                    if str(account.get("mint", "") or "").strip() and float(account.get("ui_amount", 0) or 0) > 0
+                ]
+                if hasattr(self.wallet, "get_token_prices_usd"):
+                    price_map = await self.wallet.get_token_prices_usd(mints)
+                    logger.info(f"💲 Retrieved USD prices for {len(price_map)} token(s)")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch token USD prices: {e}")
             
             # Add token details - parse token account data
             # IMPORTANT: Include ALL tokens, even with zero balance
@@ -68,6 +81,8 @@ class WalletInfo:
                     decimals = account.get("decimals", 0)
                     symbol = account.get("symbol", "UNK")
                     name = account.get("name", "Unknown Token")
+                    price_usd = float(price_map.get(mint, 0.0) or 0.0)
+                    value_usd = float(ui_amount or 0.0) * price_usd
                     
                     # IMPORTANT: Include token even if balance is 0
                     token_info = {
@@ -79,7 +94,8 @@ class WalletInfo:
                         "symbol": symbol,
                         "name": name,
                         "amount": ui_amount,
-                        "value_usd": 0.0  # Would need price data to calculate
+                        "price_usd": price_usd,
+                        "value_usd": value_usd,
                     }
                     
                     wallet_info["tokens"].append(token_info)
@@ -95,6 +111,7 @@ class WalletInfo:
                         "decimals": account.get("decimals", 0),
                         "symbol": "UNK",
                         "amount": account.get("ui_amount", 0),
+                        "price_usd": 0.0,
                         "value_usd": 0.0
                     })
             

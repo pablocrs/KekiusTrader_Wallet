@@ -40,6 +40,9 @@ class FakeWallet:
             raise RuntimeError("balance lookup failed")
         return {"mint": mint, "ui_amount": 1.23, "balance": 123}
 
+    async def get_token_prices_usd(self, mints):
+        return {"MintA": 2.0}
+
 
 @pytest.mark.asyncio
 async def test_get_full_wallet_info_success():
@@ -52,6 +55,8 @@ async def test_get_full_wallet_info_success():
     assert result["token_count"] == 1
     assert len(result["tokens"]) == 1
     assert result["tokens"][0]["mint"] == "MintA"
+    assert result["tokens"][0]["price_usd"] == 2.0
+    assert result["tokens"][0]["value_usd"] == 2.0
 
 
 @pytest.mark.asyncio

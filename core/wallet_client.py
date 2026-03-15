@@ -1,6 +1,7 @@
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed, Finalized
 from solders.keypair import Keypair
+from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey
 from solana.rpc.types import TxOpts
@@ -72,6 +73,7 @@ class WalletClient:
         self._token_accounts_cache: Optional[List[Dict]] = None
         self._token_accounts_cache_timestamp: float = 0
         self._token_metadata_cache: Dict[str, Dict[str, Any]] = {}  # mint -> {symbol, name}
+        self._token_price_cache: Dict[str, Dict[str, Any]] = {}     # mint -> {price_usd, _cache_time}
         self._token_accounts_rate_limited_until: float = 0
         self._sol_balance_rate_limited_until: float = 0
     
@@ -217,6 +219,15 @@ class WalletClient:
                             logger.warning("📦 Returning cached token accounts due to rate limit")
                             return self._token_accounts_cache
                         return []
+                    if "SerdeJSONError" in str(type(e)) or "SerdeJSONError" in str(e):
+                        logger.warning("⚠️ Solana SDK parser failed on token accounts response; trying raw JSON-RPC fallback")
+                        fallback_accounts = await self._fetch_token_accounts_via_raw_rpc()
+                        if fallback_accounts is not None:
+                            self._token_accounts_cache = fallback_accounts
+                            self._token_accounts_cache_timestamp = datetime.now().timestamp()
+                            self._token_accounts_rate_limited_until = 0
+                            logger.info(f"✅ Raw RPC fallback returned {len(fallback_accounts)} token account(s)")
+                            return fallback_accounts
                     if self._token_accounts_cache:
                         logger.warning("📦 Returning cached token accounts due to RPC error")
                         return self._token_accounts_cache
@@ -390,6 +401,104 @@ class WalletClient:
             logger.error(traceback.format_exc())
             # Return empty list on error - don't crash
             return []
+
+    async def _fetch_token_accounts_via_raw_rpc(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fallback parser for RPC responses that solders can't decode.
+        Queries both SPL Token and Token-2022 owners.
+        """
+        program_ids = [
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ]
+        wallet_addr = self.get_public_key_str()
+        all_accounts: List[Dict[str, Any]] = []
+        seen_pubkeys = set()
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            for program_id in program_ids:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        wallet_addr,
+                        {"programId": program_id},
+                        {"encoding": "jsonParsed"},
+                    ],
+                }
+                try:
+                    async with session.post(self.rpc_url, json=payload) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                f"Raw RPC fallback failed for program {program_id[:8]}... "
+                                f"status={response.status}"
+                            )
+                            continue
+                        body = await response.json()
+                except Exception as exc:
+                    logger.warning(f"Raw RPC fallback request failed for {program_id[:8]}...: {exc}")
+                    continue
+
+                values = (((body or {}).get("result") or {}).get("value") or [])
+                if not isinstance(values, list):
+                    continue
+
+                for account_info in values:
+                    try:
+                        pubkey = str(account_info.get("pubkey", ""))
+                        if not pubkey or pubkey in seen_pubkeys:
+                            continue
+                        seen_pubkeys.add(pubkey)
+                        parsed = (
+                            (((account_info.get("account") or {}).get("data") or {}).get("parsed") or {})
+                            if isinstance(account_info, dict)
+                            else {}
+                        )
+                        info = (parsed.get("info") or {}) if isinstance(parsed, dict) else {}
+                        token_amount = (info.get("tokenAmount") or {}) if isinstance(info, dict) else {}
+                        mint = str(info.get("mint", "") or "")
+                        amount = int(token_amount.get("amount", 0) or 0)
+                        decimals = int(token_amount.get("decimals", 0) or 0)
+                        ui_amount = float(token_amount.get("uiAmount", 0) or 0)
+                        if not mint:
+                            continue
+
+                        symbol = "UNK"
+                        name = "Unknown Token"
+                        try:
+                            cached = self._token_metadata_cache.get(mint)
+                            if cached:
+                                symbol = cached.get("symbol", "UNK")
+                                name = cached.get("name", "Unknown Token")
+                        except Exception:
+                            pass
+
+                        if symbol == "UNK" or name == "Unknown Token":
+                            metadata_task = asyncio.create_task(self.get_token_metadata(mint))
+                            metadata_task.add_done_callback(
+                                lambda t, m=mint: (
+                                    None if t.cancelled() else
+                                    logger.debug(f"Metadata fetch failed for {m[:8]}...: {t.exception()}")
+                                    if t.exception() else None
+                                )
+                            )
+
+                        all_accounts.append({
+                            "pubkey": pubkey,
+                            "mint": mint,
+                            "balance": amount,
+                            "ui_amount": ui_amount,
+                            "decimals": decimals,
+                            "symbol": symbol if symbol != "UNK" else mint[:8],
+                            "name": name if name != "Unknown Token" else f"Token {mint[:8]}...",
+                            "data": account_info,
+                        })
+                    except Exception as parse_exc:
+                        logger.debug(f"Fallback parser skipped malformed account row: {parse_exc}")
+                        continue
+
+        return all_accounts
     
     async def get_token_balance(self, mint: str) -> Dict[str, Any]:
         """
@@ -459,10 +568,10 @@ class WalletClient:
         try:
             # Decode transaction
             transaction_bytes = base64.b64decode(transaction_b64)
-            transaction = VersionedTransaction.from_bytes(transaction_bytes)
-            
-            # Sign transaction
-            transaction.sign([self.keypair])
+            unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
+            # solders VersionedTransaction is immutable and is signed by
+            # constructing a new tx with the original message + signer keypair.
+            transaction = VersionedTransaction(unsigned_tx.message, [self.keypair])
             
             logger.debug(f"Sending transaction (skip_preflight={skip_preflight})...")
             
@@ -518,7 +627,8 @@ class WalletClient:
             start_time = loop.time()
             
             while loop.time() - start_time < timeout:
-                response = await self.client.get_signature_statuses([signature])
+                signature_obj = Signature.from_string(signature)
+                response = await self.client.get_signature_statuses([signature_obj])
                 
                 if response.value and response.value[0]:
                     status = response.value[0]
@@ -608,6 +718,172 @@ class WalletClient:
         }
         self._token_metadata_cache[mint] = default_metadata
         return default_metadata
+
+    async def get_token_prices_usd(self, mints: List[str], force_refresh: bool = False) -> Dict[str, float]:
+        """
+        Fetch USD prices for token mints from Jupiter price API (batched).
+        Returns map mint -> usd price.
+        """
+        unique_mints = [m.strip() for m in dict.fromkeys(mints) if isinstance(m, str) and m.strip()]
+        if not unique_mints:
+            return {}
+
+        now_ts = datetime.now().timestamp()
+        ttl = max(1, int(getattr(settings, "TOKEN_PRICE_CACHE_TTL", 30)))
+        prices: Dict[str, float] = {}
+        to_fetch: List[str] = []
+
+        for mint in unique_mints:
+            if not force_refresh and mint in self._token_price_cache:
+                cached = self._token_price_cache.get(mint, {})
+                cache_age = now_ts - float(cached.get("_cache_time", 0) or 0)
+                cached_price = float(cached.get("price_usd", 0) or 0)
+                if cache_age < ttl and cached_price > 0:
+                    prices[mint] = cached_price
+                    continue
+            to_fetch.append(mint)
+
+        # Smaller batches reduce Jupiter price API throttling risk.
+        batch_size = 20
+        api_url = getattr(settings, "JUPITER_PRICE_API_URL", "https://lite-api.jup.ag/price/v2").rstrip("/")
+        timeout = aiohttp.ClientTimeout(total=max(5, int(getattr(settings, "JUPITER_HTTP_TIMEOUT_SECONDS", 30))))
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for i in range(0, len(to_fetch), batch_size):
+                batch = to_fetch[i:i + batch_size]
+                ids = ",".join(batch)
+                url = f"{api_url}?ids={ids}"
+                payload = None
+                attempts = 3
+                for attempt in range(1, attempts + 1):
+                    try:
+                        async with session.get(url) as response:
+                            if response.status == 429:
+                                if attempt < attempts:
+                                    backoff_sec = 0.4 * attempt
+                                    logger.warning(
+                                        f"Token price request rate-limited (429), retrying in {backoff_sec:.1f}s "
+                                        f"(attempt {attempt}/{attempts})"
+                                    )
+                                    await asyncio.sleep(backoff_sec)
+                                    continue
+                                logger.warning(f"Token price request failed (429) for batch size {len(batch)}")
+                                break
+                            if response.status != 200:
+                                logger.warning(f"Token price request failed ({response.status}) for batch size {len(batch)}")
+                                break
+                            payload = await response.json()
+                            break
+                    except Exception as e:
+                        if attempt < attempts:
+                            await asyncio.sleep(0.2 * attempt)
+                            continue
+                        logger.warning(f"Token price request error for batch size {len(batch)}: {e}")
+                if payload is None:
+                    continue
+
+                if not isinstance(payload, dict):
+                    continue
+                # price/v2 -> {"data": {mint: {...}}}
+                # price/v3 -> {mint: {...}}
+                if isinstance(payload.get("data"), dict):
+                    data = payload.get("data", {})
+                else:
+                    data = payload
+
+                for mint in batch:
+                    row = data.get(mint)
+                    if not isinstance(row, dict):
+                        continue
+                    raw_price = row.get("price")
+                    if raw_price is None:
+                        raw_price = row.get("usdPrice")
+                    try:
+                        price = float(raw_price or 0)
+                    except (TypeError, ValueError):
+                        price = 0.0
+                    if price > 0:
+                        prices[mint] = price
+                        self._token_price_cache[mint] = {"price_usd": price, "_cache_time": datetime.now().timestamp()}
+
+        # Hard guard for USDC valuation consistency: reject obvious bad outliers from fallback sources.
+        usdc_mint = getattr(settings, "USDC_MINT", "")
+        if usdc_mint and usdc_mint in unique_mints:
+            usdc_price = float(prices.get(usdc_mint, 0) or 0)
+            if usdc_price <= 0 or usdc_price < 0.8 or usdc_price > 1.2:
+                prices[usdc_mint] = 1.0
+                self._token_price_cache[usdc_mint] = {
+                    "price_usd": 1.0,
+                    "_cache_time": datetime.now().timestamp(),
+                }
+
+        unresolved = [mint for mint in unique_mints if mint not in prices]
+        if unresolved:
+            dex_prices = await self._fetch_token_prices_from_dexscreener(unresolved)
+            for mint, price in dex_prices.items():
+                if price > 0:
+                    prices[mint] = price
+                    self._token_price_cache[mint] = {"price_usd": price, "_cache_time": datetime.now().timestamp()}
+
+        # Stable fallback for USDC in case APIs omit it transiently
+        if usdc_mint and usdc_mint in unique_mints and usdc_mint not in prices:
+            prices[usdc_mint] = 1.0
+
+        return prices
+
+    async def _fetch_token_prices_from_dexscreener(self, mints: List[str]) -> Dict[str, float]:
+        """Fallback price source for mints unresolved by Jupiter."""
+        base_url = getattr(settings, "DEXSCREENER_TOKENS_URL", "https://api.dexscreener.com/latest/dex/tokens").rstrip("/")
+        timeout = aiohttp.ClientTimeout(total=8)
+        prices: Dict[str, float] = {}
+        semaphore = asyncio.Semaphore(8)
+
+        async def _fetch_one(session: aiohttp.ClientSession, mint: str) -> None:
+            url = f"{base_url}/{mint}"
+            async with semaphore:
+                try:
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            return
+                        payload = await response.json()
+                except Exception:
+                    return
+
+            pairs = payload.get("pairs", []) if isinstance(payload, dict) else []
+            if not isinstance(pairs, list):
+                return
+
+            best_liq = -1.0
+            best_price = 0.0
+            for pair in pairs:
+                if not isinstance(pair, dict):
+                    continue
+                if str(pair.get("chainId", "")).lower() != "solana":
+                    continue
+                try:
+                    price_usd = float(pair.get("priceUsd", 0) or 0)
+                except (TypeError, ValueError):
+                    price_usd = 0.0
+                if price_usd <= 0:
+                    continue
+                liq = pair.get("liquidity", {}) if isinstance(pair.get("liquidity"), dict) else {}
+                try:
+                    liq_usd = float(liq.get("usd", 0) or 0)
+                except (TypeError, ValueError):
+                    liq_usd = 0.0
+                if liq_usd > best_liq:
+                    best_liq = liq_usd
+                    best_price = price_usd
+
+            if best_price > 0:
+                prices[mint] = best_price
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(*[_fetch_one(session, mint) for mint in mints], return_exceptions=True)
+
+        if prices:
+            logger.info(f"✅ Dexscreener fallback priced {len(prices)} token(s)")
+        return prices
     
     def clear_cache(self):
         """Clear balance and token account cache"""
@@ -615,4 +891,5 @@ class WalletClient:
         self._token_accounts_cache = None
         self._balance_cache_timestamp = 0
         self._token_accounts_cache_timestamp = 0
+        self._token_price_cache.clear()
         logger.debug("Wallet cache cleared")

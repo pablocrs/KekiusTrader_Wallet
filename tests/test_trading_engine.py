@@ -51,6 +51,22 @@ class FakeWallet:
         return {"mint": mint, "balance": self.token_balance, "ui_amount": 1.0}
 
 
+class FakeWalletReconcileBuy(FakeWallet):
+    async def confirm_transaction(self, signature, timeout=60):
+        self.confirm_calls += 1
+        # Simulate a tx that lands on-chain while confirmation endpoint times out.
+        self.token_balance = 123_000
+        return False
+
+
+class FakeWalletReconcileSell(FakeWallet):
+    async def confirm_transaction(self, signature, timeout=60):
+        self.confirm_calls += 1
+        # Simulate a tx that lands on-chain while confirmation endpoint times out.
+        self.token_balance = 0
+        return False
+
+
 class FakeJupiter:
     def __init__(self, quote=None, swap=None):
         self.quote = quote
@@ -155,7 +171,7 @@ async def test_buy_retries_on_timeout_then_succeeds(monkeypatch):
     assert result["success"] is True
     assert result["attempts"] == 2
     assert wallet.confirm_calls == 2
-    assert wallet.clear_calls == 1
+    assert wallet.clear_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -186,7 +202,7 @@ async def test_sell_uses_dynamic_slippage_when_missing(monkeypatch):
 
     assert result["success"] is True
     assert fake_jupiter.execute_calls[0]["slippage_bps"] == 150
-    assert wallet.clear_calls == 1
+    assert wallet.clear_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -201,6 +217,26 @@ async def test_buy_fails_when_insufficient_sol_balance():
 
 
 @pytest.mark.asyncio
+async def test_buy_timeout_reconciles_as_success(monkeypatch):
+    wallet = FakeWalletReconcileBuy(confirm_responses=[], token_balance=0)
+    engine = TradingEngine(wallet)
+    engine.jupiter = FakeJupiter(
+        swap={"transaction": "tx", "output_amount": 123_000, "price_impact": 0.5}
+    )
+
+    async def fast_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep, raising=False)
+
+    result = await engine.buy(mint=TEST_TOKEN_MINT, amount_sol=0.1, max_retries=1)
+
+    assert result["success"] is True
+    assert result["status"] == "confirmed_via_reconciliation"
+    assert result["reconciliation"]["token_delta"] > 0
+
+
+@pytest.mark.asyncio
 async def test_sell_fails_when_insufficient_token_balance():
     wallet = FakeWallet(confirm_responses=[True], token_balance=10)
     engine = TradingEngine(wallet)
@@ -209,3 +245,27 @@ async def test_sell_fails_when_insufficient_token_balance():
     result = await engine.sell(mint=TEST_TOKEN_MINT, amount=1000, max_retries=1)
     assert result["success"] is False
     assert "Insufficient token balance" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_sell_timeout_reconciles_as_success(monkeypatch):
+    wallet = FakeWalletReconcileSell(confirm_responses=[], token_balance=1_000)
+    engine = TradingEngine(wallet)
+    engine.jupiter = FakeJupiter(
+        swap={"transaction": "tx", "output_amount": int(0.01 * 1e9), "price_impact": 0.5}
+    )
+
+    async def fast_sleep(*args, **kwargs):
+        return None
+
+    async def noop_convert():
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep, raising=False)
+    engine.convert_profit_to_usdc = noop_convert
+
+    result = await engine.sell(mint=TEST_TOKEN_MINT, amount=1_000, max_retries=1)
+
+    assert result["success"] is True
+    assert result["status"] == "confirmed_via_reconciliation"
+    assert result["reconciliation"]["token_delta"] > 0

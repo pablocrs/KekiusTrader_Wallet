@@ -11,10 +11,11 @@ from core.dex.jupiter_client import JupiterClient
 
 
 class FakeResponse:
-    def __init__(self, status=200, payload=None, text_payload="error"):
+    def __init__(self, status=200, payload=None, text_payload="error", headers=None):
         self.status = status
         self._payload = payload if payload is not None else {}
         self._text_payload = text_payload
+        self.headers = headers or {}
 
     async def json(self):
         return self._payload
@@ -30,7 +31,7 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, quote_response=None, swap_response=None):
+    def __init__(self, quote_response=None, swap_response=None, quote_responses=None, swap_responses=None):
         self.quote_response = quote_response or FakeResponse(
             status=200,
             payload={"outAmount": "100", "priceImpactPct": 0.2},
@@ -39,12 +40,22 @@ class FakeSession:
             status=200,
             payload={"swapTransaction": "base64tx"},
         )
+        self.quote_responses = list(quote_responses or [])
+        self.swap_responses = list(swap_responses or [])
+        self.get_calls = 0
+        self.post_calls = 0
         self.closed = False
 
     def get(self, url, params=None):
+        self.get_calls += 1
+        if self.quote_responses:
+            return self.quote_responses.pop(0)
         return self.quote_response
 
     def post(self, url, json=None):
+        self.post_calls += 1
+        if self.swap_responses:
+            return self.swap_responses.pop(0)
         return self.swap_response
 
     async def close(self):
@@ -79,6 +90,27 @@ async def test_get_quote_error_response(monkeypatch):
         amount=1000,
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_quote_retries_on_429_then_succeeds():
+    client = JupiterClient()
+    client.session = FakeSession(
+        quote_responses=[
+            FakeResponse(status=429, text_payload="rate limit", headers={"Retry-After": "0"}),
+            FakeResponse(status=200, payload={"outAmount": "77", "priceImpactPct": 0.1}),
+        ]
+    )
+
+    result = await client.get_quote(
+        input_mint="So11111111111111111111111111111111111111112",
+        output_mint="SomeMint",
+        amount=1000,
+    )
+
+    assert result is not None
+    assert result["outAmount"] == "77"
+    assert client.session.get_calls == 2
 
 
 @pytest.mark.asyncio

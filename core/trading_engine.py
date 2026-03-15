@@ -57,6 +57,8 @@ class TradingEngine:
         attempt = 1
         last_error: Optional[Exception] = None
         signature: Optional[str] = None
+        before_token_balance: Optional[int] = None
+        before_sol_balance: Optional[float] = None
 
         logger.info(f"🛒 BUY: {amount_sol} SOL → {mint}")
         try:
@@ -65,6 +67,7 @@ class TradingEngine:
             speed_mode = self._normalize_speed_mode(speed_mode)
             amount_lamports = self._sol_to_lamports(amount_sol)
             await self._ensure_buy_balance(amount_sol)
+            before_sol_balance, before_token_balance = await self._get_fresh_route_balances(mint)
 
             # Use defaults if not specified
             base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
@@ -144,6 +147,17 @@ class TradingEngine:
 
             except Exception as e:
                 last_error = e
+                reconciled = await self._reconcile_buy_success(
+                    mint=mint,
+                    amount_sol=amount_sol,
+                    before_sol_balance=before_sol_balance,
+                    before_token_balance=before_token_balance,
+                    signature=signature,
+                    attempt=attempt,
+                    error=e,
+                )
+                if reconciled:
+                    return reconciled
                 retryable = self._is_retryable_error(e)
                 logger.warning(f"BUY attempt {attempt} failed ({'retryable' if retryable else 'non-retryable'}): {e}")
 
@@ -188,6 +202,8 @@ class TradingEngine:
         attempt = 1
         last_error: Optional[Exception] = None
         signature: Optional[str] = None
+        before_token_balance: Optional[int] = None
+        before_sol_balance: Optional[float] = None
 
         logger.info(f"💸 SELL: {amount} of {mint} → SOL")
         try:
@@ -197,6 +213,7 @@ class TradingEngine:
                 raise ValueError("Sell amount must be > 0")
             speed_mode = self._normalize_speed_mode(speed_mode)
             await self._ensure_sell_balance(mint=mint, amount=amount)
+            before_sol_balance, before_token_balance = await self._get_fresh_route_balances(mint)
 
             base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
             if slippage_bps is None:
@@ -281,6 +298,21 @@ class TradingEngine:
 
             except Exception as e:
                 last_error = e
+                reconciled = await self._reconcile_sell_success(
+                    mint=mint,
+                    amount=amount,
+                    before_sol_balance=before_sol_balance,
+                    before_token_balance=before_token_balance,
+                    signature=signature,
+                    attempt=attempt,
+                    error=e,
+                )
+                if reconciled:
+                    self._schedule_background_task(
+                        self.convert_profit_to_usdc(),
+                        "convert_profit_to_usdc",
+                    )
+                    return reconciled
                 retryable = self._is_retryable_error(e)
                 logger.warning(f"SELL attempt {attempt} failed ({'retryable' if retryable else 'non-retryable'}): {e}")
 
@@ -483,6 +515,114 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error waiting for confirmation {signature}: {e}")
             raise
+
+    async def _get_fresh_route_balances(self, mint: str) -> tuple[float, int]:
+        """Read uncached SOL + token balances for reconciliation checks."""
+        self.wallet.clear_cache()
+        sol_balance = await self.wallet.get_sol_balance(use_cache=False)
+        token_info = await self.wallet.get_token_balance(mint)
+        token_balance = int(token_info.get("balance", 0) or 0)
+        return sol_balance, token_balance
+
+    async def _reconcile_buy_success(
+        self,
+        mint: str,
+        amount_sol: float,
+        before_sol_balance: Optional[float],
+        before_token_balance: Optional[int],
+        signature: Optional[str],
+        attempt: int,
+        error: Exception,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile buy outcome after uncertain failures (timeouts/send failures).
+        Marks success if token balance increased despite API-level failure.
+        """
+        if before_token_balance is None:
+            return None
+        if not self._is_reconciliation_candidate(error):
+            return None
+
+        await asyncio.sleep(1.0)
+        after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
+        token_delta = after_token_balance - before_token_balance
+
+        if token_delta <= 0:
+            return None
+
+        sol_spent = 0.0
+        if before_sol_balance is not None:
+            sol_spent = max(0.0, before_sol_balance - after_sol_balance)
+
+        logger.warning(
+            f"⚠️ BUY reconciliation marked success after error '{error}': "
+            f"token balance increased by {token_delta}"
+        )
+        return {
+            "success": True,
+            "signature": signature,
+            "type": "BUY",
+            "mint": mint,
+            "input_amount": amount_sol,
+            "output_amount": token_delta,
+            "price_impact": None,
+            "status": "confirmed_via_reconciliation",
+            "attempts": attempt,
+            "reconciliation": {
+                "token_delta": token_delta,
+                "sol_spent": sol_spent,
+            },
+        }
+
+    async def _reconcile_sell_success(
+        self,
+        mint: str,
+        amount: int,
+        before_sol_balance: Optional[float],
+        before_token_balance: Optional[int],
+        signature: Optional[str],
+        attempt: int,
+        error: Exception,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile sell outcome after uncertain failures (timeouts/send failures).
+        Marks success if token balance decreased despite API-level failure.
+        """
+        if before_token_balance is None:
+            return None
+        if not self._is_reconciliation_candidate(error):
+            return None
+
+        await asyncio.sleep(1.0)
+        after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
+        token_delta = max(0, before_token_balance - after_token_balance)
+        if token_delta <= 0:
+            return None
+
+        sol_gained = 0.0
+        if before_sol_balance is not None:
+            sol_gained = max(0.0, after_sol_balance - before_sol_balance)
+
+        logger.warning(
+            f"⚠️ SELL reconciliation marked success after error '{error}': "
+            f"token balance decreased by {token_delta}"
+        )
+        return {
+            "success": True,
+            "signature": signature,
+            "type": "SELL",
+            "mint": mint,
+            "input_amount": amount,
+            "output_amount_lamports": int(sol_gained * 1e9),
+            "output_amount_sol": sol_gained,
+            "price_impact": None,
+            "status": "confirmed_via_reconciliation",
+            "attempts": attempt,
+            "reconciliation": {
+                "token_delta": token_delta,
+                "sold_amount_requested": amount,
+            },
+        }
     
     async def calculate_dynamic_slippage(
         self,
@@ -649,6 +789,13 @@ class TradingEngine:
         
         # Default to retry if not explicitly non-retryable
         return True
+
+    def _is_reconciliation_candidate(self, error: Exception) -> bool:
+        """Errors where on-chain state may have changed despite API failure."""
+        if isinstance(error, asyncio.TimeoutError):
+            return True
+        message = str(error).lower()
+        return "timeout" in message or "failed to send transaction" in message
 
     def _validate_mint(self, mint: str) -> str:
         mint = (mint or "").strip()
