@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     
     # Trading Configuration
     DEFAULT_SLIPPAGE_BPS: int = 100  # 1% slippage
+    MAX_SLIPPAGE_BPS: int = 500      # 5% hard cap safeguard
     DEFAULT_SPEED_MODE: str = "ULTRA_FAST"  # ULTRA_FAST, BALANCED, SAFE
+    MIN_FEE_RESERVE_SOL: float = 0.005      # SOL reserve to avoid fee starvation
     
     # Priority Fees (in microlamports)
     PRIORITY_FEE_ULTRA_FAST: int = 100000  # 0.0001 SOL

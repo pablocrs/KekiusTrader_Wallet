@@ -9,20 +9,20 @@ class BuyRequest(BaseModel):
     """Buy token request"""
     mint: str = Field(..., description="Token mint address to buy")
     amount_sol: float = Field(..., gt=0, description="Amount of SOL to spend")
-    slippage_bps: Optional[int] = Field(None, ge=0, le=10000, description="Slippage in basis points (100 = 1%)")
+    slippage_bps: Optional[int] = Field(None, gt=0, le=500, description="Slippage in basis points (max 500 = 5%)")
     speed_mode: Optional[str] = Field(None, description="ULTRA_FAST, BALANCED, or SAFE")
 
 class SellRequest(BaseModel):
     """Sell token request"""
     mint: str = Field(..., description="Token mint address to sell")
     amount: int = Field(..., gt=0, description="Amount of tokens to sell (base units)")
-    slippage_bps: Optional[int] = Field(None, ge=0, le=10000, description="Slippage in basis points")
+    slippage_bps: Optional[int] = Field(None, gt=0, le=500, description="Slippage in basis points (max 500 = 5%)")
     speed_mode: Optional[str] = Field(None, description="Speed mode")
 
 class SellAllRequest(BaseModel):
     """Sell all tokens request"""
     mint: str = Field(..., description="Token mint address to sell completely")
-    slippage_bps: Optional[int] = Field(None, ge=0, le=10000, description="Slippage in basis points")
+    slippage_bps: Optional[int] = Field(None, gt=0, le=500, description="Slippage in basis points (max 500 = 5%)")
     speed_mode: Optional[str] = Field(None, description="Speed mode")
 
 
@@ -82,6 +82,12 @@ class ApiServer:
     
     def setup_routes(self):
         """Setup API routes"""
+        def _http_status_for_trade_error(error_message: str) -> int:
+            message = (error_message or "").lower()
+            for marker in ("invalid", "insufficient", "must be", "cannot", "exceeds max", "no balance"):
+                if marker in message:
+                    return 400
+            return 500
         
         @self.app.get("/health")
         async def health_check():
@@ -115,7 +121,7 @@ class ApiServer:
                 
                 if not result or not result.get("success", False):
                     error_message = (result or {}).get("error", "Buy operation failed")
-                    raise HTTPException(status_code=500, detail=error_message)
+                    raise HTTPException(status_code=_http_status_for_trade_error(error_message), detail=error_message)
                 
                 return {
                     "success": True,
@@ -148,7 +154,7 @@ class ApiServer:
                 
                 if not result or not result.get("success", False):
                     error_message = (result or {}).get("error", "Sell operation failed")
-                    raise HTTPException(status_code=500, detail=error_message)
+                    raise HTTPException(status_code=_http_status_for_trade_error(error_message), detail=error_message)
                 
                 return {
                     "success": True,
@@ -185,7 +191,7 @@ class ApiServer:
                     )
                 if not result.get("success", False):
                     error_message = result.get("error", "Sell-all operation failed")
-                    raise HTTPException(status_code=500, detail=error_message)
+                    raise HTTPException(status_code=_http_status_for_trade_error(error_message), detail=error_message)
                 
                 return {
                     "success": True,

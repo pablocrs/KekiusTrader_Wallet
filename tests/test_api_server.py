@@ -91,6 +91,15 @@ def test_buy_failure_returns_500(api_client):
     assert "buy failed for testing" in response.json()["detail"]
 
 
+def test_buy_validation_failure_returns_400(api_client):
+    client, engine = api_client
+    engine.buy_result = {"success": False, "error": "Invalid mint address"}
+    payload = {"mint": "SomeMint", "amount_sol": 0.1}
+    response = client.post("/buy", json=payload)
+    assert response.status_code == 400
+    assert "Invalid mint address" in response.json()["detail"]
+
+
 def test_sell_failure_returns_500(api_client):
     client, engine = api_client
     engine.sell_result = {"success": False, "error": "sell failed for testing"}

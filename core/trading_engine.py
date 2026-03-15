@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 from config import settings
 import asyncio
 from decimal import Decimal
+from solders.pubkey import Pubkey
 
 class TradingEngine:
     """
@@ -58,22 +59,36 @@ class TradingEngine:
         signature: Optional[str] = None
 
         logger.info(f"🛒 BUY: {amount_sol} SOL → {mint}")
+        try:
+            mint = self._validate_mint(mint)
+            self._ensure_not_sol_mint(mint, operation="buy")
+            speed_mode = self._normalize_speed_mode(speed_mode)
+            amount_lamports = self._sol_to_lamports(amount_sol)
+            await self._ensure_buy_balance(amount_sol)
 
-        # Use defaults if not specified
-        base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
-        speed_mode = speed_mode or settings.DEFAULT_SPEED_MODE
-        # Compute dynamic slippage when not provided
-        if slippage_bps is None:
-            slippage_bps = await self.calculate_dynamic_slippage(
-                mint=mint,
-                trade_amount_sol=amount_sol,
-                base_slippage_bps=base_slippage_bps
-            )
-        else:
-            slippage_bps = slippage_bps
-
-        # Convert SOL to lamports
-        amount_lamports = int(amount_sol * 1e9)
+            # Use defaults if not specified
+            base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
+            if slippage_bps is None:
+                slippage_bps = await self.calculate_dynamic_slippage_for_route(
+                    input_mint=SOL_MINT,
+                    output_mint=mint,
+                    amount=amount_lamports,
+                    base_slippage_bps=base_slippage_bps,
+                )
+            else:
+                slippage_bps = self._normalize_slippage_bps(slippage_bps)
+        except Exception as e:
+            logger.error(f"❌ BUY validation failed: {e}")
+            return {
+                "success": False,
+                "signature": None,
+                "type": "BUY",
+                "mint": mint,
+                "input_amount": amount_sol,
+                "status": "failed",
+                "attempts": 0,
+                "error": str(e),
+            }
 
         while attempt <= max_retries:
             wait_time = (2 ** (attempt - 1)) * 0.5 if attempt > 1 else 0
@@ -175,32 +190,36 @@ class TradingEngine:
         signature: Optional[str] = None
 
         logger.info(f"💸 SELL: {amount} of {mint} → SOL")
+        try:
+            mint = self._validate_mint(mint)
+            self._ensure_not_sol_mint(mint, operation="sell")
+            if amount <= 0:
+                raise ValueError("Sell amount must be > 0")
+            speed_mode = self._normalize_speed_mode(speed_mode)
+            await self._ensure_sell_balance(mint=mint, amount=amount)
 
-        base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
-        speed_mode = speed_mode or settings.DEFAULT_SPEED_MODE
-
-        if slippage_bps is None:
-            # Estimate trade size in SOL for dynamic slippage calculation
-            estimated_sol_amount = None
-            try:
-                sell_quote = await self.jupiter.get_quote(
+            base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
+            if slippage_bps is None:
+                slippage_bps = await self.calculate_dynamic_slippage_for_route(
                     input_mint=mint,
                     output_mint=SOL_MINT,
                     amount=amount,
-                    slippage_bps=base_slippage_bps
+                    base_slippage_bps=base_slippage_bps,
                 )
-                if sell_quote and sell_quote.get("outAmount") is not None:
-                    estimated_sol_amount = int(sell_quote.get("outAmount", 0)) / 1e9
-            except Exception as e:
-                logger.debug(f"Could not estimate sell quote for slippage: {e}")
-
-            slippage_bps = await self.calculate_dynamic_slippage(
-                mint=mint,
-                trade_amount_sol=estimated_sol_amount or 0,
-                base_slippage_bps=base_slippage_bps
-            )
-        else:
-            slippage_bps = slippage_bps
+            else:
+                slippage_bps = self._normalize_slippage_bps(slippage_bps)
+        except Exception as e:
+            logger.error(f"❌ SELL validation failed: {e}")
+            return {
+                "success": False,
+                "signature": None,
+                "type": "SELL",
+                "mint": mint,
+                "input_amount": amount,
+                "status": "failed",
+                "attempts": 0,
+                "error": str(e),
+            }
 
         while attempt <= max_retries:
             wait_time = (2 ** (attempt - 1)) * 0.5 if attempt > 1 else 0
@@ -478,38 +497,56 @@ class TradingEngine:
             amount_lamports = int(Decimal(trade_amount_sol) * Decimal(1e9))
         except Exception:
             amount_lamports = 0
-        
+
+        return await self.calculate_dynamic_slippage_for_route(
+            input_mint=SOL_MINT,
+            output_mint=mint,
+            amount=amount_lamports,
+            base_slippage_bps=base_slippage_bps,
+        )
+
+    async def calculate_dynamic_slippage_for_route(
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount: int,
+        base_slippage_bps: int = 100,
+    ) -> int:
+        """Calculate slippage based on quote price impact for a specific route."""
         try:
             quote = await self.jupiter.get_quote(
-                input_mint=SOL_MINT,
-                output_mint=mint,
-                amount=amount_lamports,
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount=max(0, int(amount)),
                 slippage_bps=base_slippage_bps
             )
-            
+
             if not quote:
                 logger.warning("⚠️ Quote failed for dynamic slippage, using 2x base")
-                return min(base_slippage_bps * 2, 500)
-            
+                return min(base_slippage_bps * 2, settings.MAX_SLIPPAGE_BPS)
+
             price_impact = float(quote.get("priceImpactPct", 0) or 0)
-            
+
             if price_impact <= 1.0:
                 adjusted_slippage = base_slippage_bps
             else:
                 adjusted_slippage = int(base_slippage_bps * price_impact)
-            
-            adjusted_slippage = min(adjusted_slippage, 500)
-            
+
+            adjusted_slippage = min(adjusted_slippage, settings.MAX_SLIPPAGE_BPS)
+
             if adjusted_slippage != base_slippage_bps:
-                logger.info(f"🧮 Adjusted slippage from {base_slippage_bps} -> {adjusted_slippage} bps (price impact {price_impact:.2f}%)")
-            
+                logger.info(
+                    f"🧮 Adjusted slippage from {base_slippage_bps} -> {adjusted_slippage} bps "
+                    f"(price impact {price_impact:.2f}%)"
+                )
+
             if price_impact > 3.0:
                 logger.warning(f"⚠️ High price impact detected ({price_impact:.2f}%), consider reducing size")
-            
+
             return adjusted_slippage
         except Exception as e:
             logger.warning(f"⚠️ Dynamic slippage calculation failed, using 2x base: {e}")
-            return min(base_slippage_bps * 2, 500)
+            return min(base_slippage_bps * 2, settings.MAX_SLIPPAGE_BPS)
     
     async def _check_cold_wallet_transfer(self):
         """
@@ -612,3 +649,61 @@ class TradingEngine:
         
         # Default to retry if not explicitly non-retryable
         return True
+
+    def _validate_mint(self, mint: str) -> str:
+        mint = (mint or "").strip()
+        if not mint:
+            raise ValueError("Mint is required")
+        try:
+            Pubkey.from_string(mint)
+        except Exception as exc:
+            raise ValueError(f"Invalid mint address: {mint}") from exc
+        return mint
+
+    def _ensure_not_sol_mint(self, mint: str, operation: str) -> None:
+        if mint == SOL_MINT:
+            raise ValueError(f"Cannot {operation} SOL via token swap route")
+
+    def _normalize_speed_mode(self, speed_mode: Optional[str]) -> str:
+        mode = (speed_mode or settings.DEFAULT_SPEED_MODE or "BALANCED").strip().upper()
+        allowed = {"ULTRA_FAST", "BALANCED", "SAFE"}
+        if mode not in allowed:
+            raise ValueError(f"Invalid speed_mode '{mode}'. Allowed: ULTRA_FAST, BALANCED, SAFE")
+        return mode
+
+    def _normalize_slippage_bps(self, slippage_bps: int) -> int:
+        value = int(slippage_bps)
+        if value <= 0:
+            raise ValueError("slippage_bps must be > 0")
+        if value > settings.MAX_SLIPPAGE_BPS:
+            raise ValueError(f"slippage_bps exceeds max allowed ({settings.MAX_SLIPPAGE_BPS})")
+        return value
+
+    def _sol_to_lamports(self, amount_sol: float) -> int:
+        try:
+            amount = Decimal(str(amount_sol))
+        except Exception as exc:
+            raise ValueError("amount_sol must be a valid number") from exc
+        if amount <= 0:
+            raise ValueError("amount_sol must be > 0")
+        lamports = int(amount * Decimal(1e9))
+        if lamports <= 0:
+            raise ValueError("amount_sol is too small (must be >= 1 lamport)")
+        return lamports
+
+    async def _ensure_buy_balance(self, amount_sol: float) -> None:
+        balance_sol = await self.wallet.get_sol_balance(use_cache=False)
+        required_total = float(amount_sol) + float(settings.MIN_FEE_RESERVE_SOL)
+        if balance_sol < required_total:
+            raise ValueError(
+                f"Insufficient SOL balance: need {required_total:.6f} SOL "
+                f"(including reserve {settings.MIN_FEE_RESERVE_SOL:.6f}), have {balance_sol:.6f}"
+            )
+
+    async def _ensure_sell_balance(self, mint: str, amount: int) -> None:
+        balance_info = await self.wallet.get_token_balance(mint)
+        current_balance = int(balance_info.get("balance", 0) or 0)
+        if current_balance < int(amount):
+            raise ValueError(
+                f"Insufficient token balance for {mint}: need {amount}, have {current_balance}"
+            )

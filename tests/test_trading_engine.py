@@ -12,10 +12,14 @@ from core.trading_engine import TradingEngine
 from config import settings
 from core.wallet_client import SOL_MINT
 
+TEST_TOKEN_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+
 
 class FakeWallet:
-    def __init__(self, confirm_responses):
+    def __init__(self, confirm_responses, sol_balance=10.0, token_balance=2_000_000_000):
         self.confirm_responses = list(confirm_responses)
+        self.sol_balance = sol_balance
+        self.token_balance = token_balance
         self.send_calls = 0
         self.confirm_calls = 0
         self.clear_calls = 0
@@ -41,7 +45,10 @@ class FakeWallet:
         self.clear_calls += 1
 
     async def get_sol_balance(self, use_cache=True):
-        return 10.0
+        return self.sol_balance
+
+    async def get_token_balance(self, mint: str):
+        return {"mint": mint, "balance": self.token_balance, "ui_amount": 1.0}
 
 
 class FakeJupiter:
@@ -96,7 +103,7 @@ async def test_calculate_dynamic_slippage_base_when_low_impact():
     )
 
     result = await engine.calculate_dynamic_slippage(
-        mint="SomeMint", trade_amount_sol=1.0, base_slippage_bps=100
+        mint=TEST_TOKEN_MINT, trade_amount_sol=1.0, base_slippage_bps=100
     )
     assert result == 100
 
@@ -111,7 +118,7 @@ async def test_calculate_dynamic_slippage_scales_and_caps():
     )
 
     result = await engine.calculate_dynamic_slippage(
-        mint="SomeMint", trade_amount_sol=1.0, base_slippage_bps=120
+        mint=TEST_TOKEN_MINT, trade_amount_sol=1.0, base_slippage_bps=120
     )
     # 120 * 10 = 1200 but should cap at 500
     assert result == 500
@@ -124,7 +131,7 @@ async def test_calculate_dynamic_slippage_fallback_on_quote_failure():
     engine.jupiter = FakeJupiter(quote=None)
 
     result = await engine.calculate_dynamic_slippage(
-        mint="SomeMint", trade_amount_sol=1.0, base_slippage_bps=90
+        mint=TEST_TOKEN_MINT, trade_amount_sol=1.0, base_slippage_bps=90
     )
     # 2x base with cap
     assert result == 180
@@ -143,7 +150,7 @@ async def test_buy_retries_on_timeout_then_succeeds(monkeypatch):
         return None
     monkeypatch.setattr(asyncio, "sleep", fast_sleep, raising=False)
 
-    result = await engine.buy(mint="SomeMint", amount_sol=0.1, max_retries=3)
+    result = await engine.buy(mint=TEST_TOKEN_MINT, amount_sol=0.1, max_retries=3)
 
     assert result["success"] is True
     assert result["attempts"] == 2
@@ -162,19 +169,43 @@ async def test_sell_uses_dynamic_slippage_when_missing(monkeypatch):
     engine.jupiter = fake_jupiter
 
     # Stub dynamic slippage calculation to ensure it is used
-    async def fake_dynamic_slippage(mint, trade_amount_sol, base_slippage_bps=100):
+    async def fake_dynamic_slippage(input_mint, output_mint, amount, base_slippage_bps=100):
+        assert input_mint == TEST_TOKEN_MINT
+        assert output_mint == SOL_MINT
+        assert amount == 1_000_000_000
         return 150
 
-    engine.calculate_dynamic_slippage = fake_dynamic_slippage
+    engine.calculate_dynamic_slippage_for_route = fake_dynamic_slippage
     # Avoid background tasks executing real logic
     async def noop_convert():
         return None
 
     engine.convert_profit_to_usdc = noop_convert
 
-    result = await engine.sell(mint="SomeMint", amount=1_000_000_000, slippage_bps=None, max_retries=2)
+    result = await engine.sell(mint=TEST_TOKEN_MINT, amount=1_000_000_000, slippage_bps=None, max_retries=2)
 
     assert result["success"] is True
     assert fake_jupiter.execute_calls[0]["slippage_bps"] == 150
     assert wallet.clear_calls == 1
 
+
+@pytest.mark.asyncio
+async def test_buy_fails_when_insufficient_sol_balance():
+    wallet = FakeWallet(confirm_responses=[True], sol_balance=0.001)
+    engine = TradingEngine(wallet)
+    engine.jupiter = FakeJupiter()
+
+    result = await engine.buy(mint=TEST_TOKEN_MINT, amount_sol=0.01, max_retries=1)
+    assert result["success"] is False
+    assert "Insufficient SOL balance" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_sell_fails_when_insufficient_token_balance():
+    wallet = FakeWallet(confirm_responses=[True], token_balance=10)
+    engine = TradingEngine(wallet)
+    engine.jupiter = FakeJupiter()
+
+    result = await engine.sell(mint=TEST_TOKEN_MINT, amount=1000, max_retries=1)
+    assert result["success"] is False
+    assert "Insufficient token balance" in result["error"]
