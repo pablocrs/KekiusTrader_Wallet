@@ -4,6 +4,8 @@ services:
   wallet:
     build: .
     container_name: kekius_wallet
+    env_file:
+      - ./.env
     ports:
       - "8003:8003"
     environment:
@@ -21,6 +23,10 @@ services:
       - WALLET_BALANCE_CACHE_TTL=${WALLET_BALANCE_CACHE_TTL:-20}
       - TOKEN_ACCOUNTS_CACHE_TTL=${TOKEN_ACCOUNTS_CACHE_TTL:-30}
       - RPC_RATE_LIMIT_COOLDOWN_SEC=${RPC_RATE_LIMIT_COOLDOWN_SEC:-45}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://lite-api.jup.ag/swap/v1}
+      - JUPITER_API_FALLBACK_URL=${JUPITER_API_FALLBACK_URL:-https://api.jup.ag/swap/v1}
+      - JUPITER_API_KEY=${JUPITER_API_KEY:-}
+      - JUPITER_PRICE_API_URL=${JUPITER_PRICE_API_URL:-https://lite-api.jup.ag/price/v3}
     restart: unless-stopped
     networks:
       - kekius-network
