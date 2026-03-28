@@ -16,10 +16,19 @@ TEST_TOKEN_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 
 
 class FakeWallet:
-    def __init__(self, confirm_responses, sol_balance=10.0, token_balance=2_000_000_000):
+    def __init__(
+        self,
+        confirm_responses,
+        sol_balance=10.0,
+        token_balance=2_000_000_000,
+        token_ui_amount=1.0,
+        usdc_ui_balance=1_000.0,
+    ):
         self.confirm_responses = list(confirm_responses)
         self.sol_balance = sol_balance
         self.token_balance = token_balance
+        self.token_ui_amount = token_ui_amount
+        self.usdc_ui_balance = usdc_ui_balance
         self.send_calls = 0
         self.confirm_calls = 0
         self.clear_calls = 0
@@ -48,7 +57,14 @@ class FakeWallet:
         return self.sol_balance
 
     async def get_token_balance(self, mint: str):
-        return {"mint": mint, "balance": self.token_balance, "ui_amount": 1.0}
+        if mint == settings.USDC_MINT:
+            return {
+                "mint": mint,
+                "balance": int(self.usdc_ui_balance * 1_000_000),
+                "decimals": 6,
+                "ui_amount": self.usdc_ui_balance,
+            }
+        return {"mint": mint, "balance": self.token_balance, "ui_amount": self.token_ui_amount}
 
 
 class FakeWalletReconcileBuy(FakeWallet):
@@ -214,6 +230,44 @@ async def test_buy_fails_when_insufficient_sol_balance():
     result = await engine.buy(mint=TEST_TOKEN_MINT, amount_sol=0.01, max_retries=1)
     assert result["success"] is False
     assert "Insufficient SOL balance" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_buy_with_usdc_uses_usdc_input_route():
+    wallet = FakeWallet(confirm_responses=[True], sol_balance=0.02, usdc_ui_balance=100.0)
+    engine = TradingEngine(wallet)
+    fake_jupiter = FakeJupiter(
+        swap={"transaction": "tx", "output_amount": 123, "price_impact": 0.5}
+    )
+    engine.jupiter = fake_jupiter
+
+    result = await engine.buy(
+        mint=TEST_TOKEN_MINT,
+        amount=12.345678,
+        spend_denom="USDC",
+        max_retries=1,
+    )
+
+    assert result["success"] is True
+    assert result["input_denom"] == "USDC"
+    assert fake_jupiter.execute_calls[0]["input_mint"] == settings.USDC_MINT
+    assert fake_jupiter.execute_calls[0]["amount"] == 12_345_678
+
+
+@pytest.mark.asyncio
+async def test_buy_with_usdc_fails_when_insufficient_usdc_balance():
+    wallet = FakeWallet(confirm_responses=[True], sol_balance=0.02, usdc_ui_balance=0.5)
+    engine = TradingEngine(wallet)
+    engine.jupiter = FakeJupiter()
+
+    result = await engine.buy(
+        mint=TEST_TOKEN_MINT,
+        amount=1.0,
+        spend_denom="USDC",
+        max_retries=1,
+    )
+    assert result["success"] is False
+    assert "Insufficient USDC balance" in result["error"]
 
 
 @pytest.mark.asyncio

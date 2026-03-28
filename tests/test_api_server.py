@@ -37,8 +37,10 @@ class FakeTradingEngine:
         self.sell_all_result = {"success": True, "signature": "sig-sell-all"}
         self.convert_result = {"success": True, "signature": "sig-convert"}
         self.convert_sol_result = {"success": True, "signature": "sig-convert-sol"}
+        self.last_buy_kwargs = {}
 
     async def buy(self, **kwargs):
+        self.last_buy_kwargs = dict(kwargs)
         return self.buy_result
 
     async def sell(self, **kwargs):
@@ -98,6 +100,22 @@ def test_buy_validation_failure_returns_400(api_client):
     response = client.post("/buy", json=payload)
     assert response.status_code == 400
     assert "Invalid mint address" in response.json()["detail"]
+
+
+def test_buy_with_usdc_amount_routes_denom(api_client):
+    client, engine = api_client
+    payload = {"mint": "SomeMint", "amount": 25.5, "spend_denom": "USDC"}
+    response = client.post("/buy", json=payload)
+    assert response.status_code == 200
+    assert engine.last_buy_kwargs["amount"] == 25.5
+    assert engine.last_buy_kwargs["spend_denom"] == "USDC"
+
+
+def test_buy_missing_amount_returns_400(api_client):
+    client, _ = api_client
+    payload = {"mint": "SomeMint", "spend_denom": "USDC"}
+    response = client.post("/buy", json=payload)
+    assert response.status_code == 400
 
 
 def test_sell_failure_returns_500(api_client):

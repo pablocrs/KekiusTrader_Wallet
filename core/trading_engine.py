@@ -7,6 +7,8 @@ import asyncio
 from decimal import Decimal
 from solders.pubkey import Pubkey
 
+USDC_DECIMALS = 6
+
 class TradingEngine:
     """
     High-performance trading engine with buy/sell operations.
@@ -37,19 +39,23 @@ class TradingEngine:
     async def buy(
         self,
         mint: str,
-        amount_sol: float,
+        amount_sol: Optional[float] = None,
         slippage_bps: Optional[int] = None,
         speed_mode: Optional[str] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        spend_denom: str = "SOL",
+        amount: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Buy a token with SOL.
+        Buy a token with the selected spend denomination (SOL or USDC).
         
         Args:
             mint: Token mint address to buy
-            amount_sol: Amount of SOL to spend
+            amount_sol: Deprecated alias for spend amount (kept for compatibility)
             slippage_bps: Slippage tolerance (uses default if None)
             speed_mode: ULTRA_FAST, BALANCED, or SAFE
+            spend_denom: Spend denomination (SOL or USDC)
+            amount: Spend amount in spend_denom units
         
         Returns:
             Transaction result with signature and amounts
@@ -59,23 +65,38 @@ class TradingEngine:
         signature: Optional[str] = None
         before_token_balance: Optional[int] = None
         before_sol_balance: Optional[float] = None
+        spend_amount: float = 0.0
+        normalized_spend_denom = "SOL"
+        input_mint = SOL_MINT
 
-        logger.info(f"🛒 BUY: {amount_sol} SOL → {mint}")
+        logger.info(f"🛒 BUY request: mint={mint} amount={amount if amount is not None else amount_sol} denom={spend_denom}")
         try:
             mint = self._validate_mint(mint)
             self._ensure_not_sol_mint(mint, operation="buy")
+            if amount is not None and amount_sol is not None and abs(float(amount) - float(amount_sol)) > 1e-12:
+                raise ValueError("Provide either amount or amount_sol (or ensure they match)")
+            raw_amount = amount if amount is not None else amount_sol
+            if raw_amount is None:
+                raise ValueError("Buy amount is required")
+            spend_amount = float(raw_amount)
+            if spend_amount <= 0:
+                raise ValueError("Buy amount must be > 0")
+            normalized_spend_denom = self._normalize_spend_denom(spend_denom)
+            input_mint = self._input_mint_for_spend_denom(normalized_spend_denom)
+            if mint == input_mint:
+                raise ValueError(f"Cannot buy {mint} using the same spend asset ({normalized_spend_denom})")
             speed_mode = self._normalize_speed_mode(speed_mode)
-            amount_lamports = self._sol_to_lamports(amount_sol)
-            await self._ensure_buy_balance(amount_sol)
+            amount_in_base_units = self._spend_amount_to_base_units(spend_amount, normalized_spend_denom)
+            await self._ensure_buy_balance(spend_amount, normalized_spend_denom)
             before_sol_balance, before_token_balance = await self._get_fresh_route_balances(mint)
 
             # Use defaults if not specified
             base_slippage_bps = settings.DEFAULT_SLIPPAGE_BPS
             if slippage_bps is None:
                 slippage_bps = await self.calculate_dynamic_slippage_for_route(
-                    input_mint=SOL_MINT,
+                    input_mint=input_mint,
                     output_mint=mint,
-                    amount=amount_lamports,
+                    amount=amount_in_base_units,
                     base_slippage_bps=base_slippage_bps,
                 )
             else:
@@ -87,7 +108,8 @@ class TradingEngine:
                 "signature": None,
                 "type": "BUY",
                 "mint": mint,
-                "input_amount": amount_sol,
+                "input_amount": spend_amount,
+                "input_denom": normalized_spend_denom,
                 "status": "failed",
                 "attempts": 0,
                 "error": str(e),
@@ -104,9 +126,9 @@ class TradingEngine:
                 priority_fee = self._get_priority_fee(speed_mode)
 
                 swap_data = await self.jupiter.execute_swap(
-                    input_mint=SOL_MINT,
+                    input_mint=input_mint,
                     output_mint=mint,
-                    amount=amount_lamports,
+                    amount=amount_in_base_units,
                     user_public_key=self.wallet.get_public_key_str(),
                     slippage_bps=slippage_bps,
                     priority_fee=priority_fee
@@ -135,7 +157,8 @@ class TradingEngine:
                     "signature": signature,
                     "type": "BUY",
                     "mint": mint,
-                    "input_amount": amount_sol,
+                    "input_amount": spend_amount,
+                    "input_denom": normalized_spend_denom,
                     "output_amount": swap_data["output_amount"],
                     "price_impact": swap_data["price_impact"],
                     "status": "confirmed",
@@ -149,7 +172,8 @@ class TradingEngine:
                 last_error = e
                 reconciled = await self._reconcile_buy_success(
                     mint=mint,
-                    amount_sol=amount_sol,
+                    amount_spend=spend_amount,
+                    spend_denom=normalized_spend_denom,
                     before_sol_balance=before_sol_balance,
                     before_token_balance=before_token_balance,
                     signature=signature,
@@ -173,7 +197,8 @@ class TradingEngine:
             "signature": signature,
             "type": "BUY",
             "mint": mint,
-            "input_amount": amount_sol,
+            "input_amount": spend_amount,
+            "input_denom": normalized_spend_denom,
             "status": "failed",
             "attempts": attempt,
             "error": str(last_error) if last_error else "Unknown error"
@@ -527,7 +552,8 @@ class TradingEngine:
     async def _reconcile_buy_success(
         self,
         mint: str,
-        amount_sol: float,
+        amount_spend: float,
+        spend_denom: str,
         before_sol_balance: Optional[float],
         before_token_balance: Optional[int],
         signature: Optional[str],
@@ -563,7 +589,8 @@ class TradingEngine:
             "signature": signature,
             "type": "BUY",
             "mint": mint,
-            "input_amount": amount_sol,
+            "input_amount": amount_spend,
+            "input_denom": spend_denom,
             "output_amount": token_delta,
             "price_impact": None,
             "status": "confirmed_via_reconciliation",
@@ -826,6 +853,33 @@ class TradingEngine:
             raise ValueError(f"slippage_bps exceeds max allowed ({settings.MAX_SLIPPAGE_BPS})")
         return value
 
+    def _normalize_spend_denom(self, spend_denom: str) -> str:
+        denom = (spend_denom or "SOL").strip().upper()
+        allowed = {"SOL", "USDC"}
+        if denom not in allowed:
+            raise ValueError(f"Invalid spend_denom '{denom}'. Allowed: SOL, USDC")
+        return denom
+
+    def _input_mint_for_spend_denom(self, spend_denom: str) -> str:
+        if spend_denom == "SOL":
+            return SOL_MINT
+        usdc_mint = self._validate_mint(settings.USDC_MINT)
+        return usdc_mint
+
+    def _spend_amount_to_base_units(self, amount: float, spend_denom: str) -> int:
+        if spend_denom == "SOL":
+            return self._sol_to_lamports(amount)
+        try:
+            usdc_amount = Decimal(str(amount))
+        except Exception as exc:
+            raise ValueError("amount must be a valid number") from exc
+        if usdc_amount <= 0:
+            raise ValueError("amount must be > 0")
+        units = int(usdc_amount * Decimal(10 ** USDC_DECIMALS))
+        if units <= 0:
+            raise ValueError("amount is too small for USDC precision")
+        return units
+
     def _sol_to_lamports(self, amount_sol: float) -> int:
         try:
             amount = Decimal(str(amount_sol))
@@ -838,13 +892,34 @@ class TradingEngine:
             raise ValueError("amount_sol is too small (must be >= 1 lamport)")
         return lamports
 
-    async def _ensure_buy_balance(self, amount_sol: float) -> None:
+    async def _ensure_buy_balance(self, amount: float, spend_denom: str) -> None:
         balance_sol = await self.wallet.get_sol_balance(use_cache=False)
-        required_total = float(amount_sol) + float(settings.MIN_FEE_RESERVE_SOL)
-        if balance_sol < required_total:
+        if spend_denom == "SOL":
+            required_total = float(amount) + float(settings.MIN_FEE_RESERVE_SOL)
+            if balance_sol < required_total:
+                raise ValueError(
+                    f"Insufficient SOL balance: need {required_total:.6f} SOL "
+                    f"(including reserve {settings.MIN_FEE_RESERVE_SOL:.6f}), have {balance_sol:.6f}"
+                )
+            return
+
+        if balance_sol < float(settings.MIN_FEE_RESERVE_SOL):
             raise ValueError(
-                f"Insufficient SOL balance: need {required_total:.6f} SOL "
-                f"(including reserve {settings.MIN_FEE_RESERVE_SOL:.6f}), have {balance_sol:.6f}"
+                f"Insufficient SOL for transaction fees: need at least {settings.MIN_FEE_RESERVE_SOL:.6f} SOL, "
+                f"have {balance_sol:.6f}"
+            )
+        usdc_mint = self._input_mint_for_spend_denom("USDC")
+        balance_info = await self.wallet.get_token_balance(usdc_mint)
+        current_ui = float(balance_info.get("ui_amount", 0) or 0.0)
+        if current_ui <= 0:
+            raw_balance = int(balance_info.get("balance", 0) or 0)
+            decimals = int(balance_info.get("decimals", USDC_DECIMALS) or USDC_DECIMALS)
+            if decimals < 0:
+                decimals = USDC_DECIMALS
+            current_ui = raw_balance / float(10 ** decimals)
+        if current_ui + 1e-9 < float(amount):
+            raise ValueError(
+                f"Insufficient USDC balance: need {float(amount):.6f} USDC, have {current_ui:.6f}"
             )
 
     async def _ensure_sell_balance(self, mint: str, amount: int) -> None:

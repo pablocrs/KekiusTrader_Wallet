@@ -8,7 +8,9 @@ from config import settings
 class BuyRequest(BaseModel):
     """Buy token request"""
     mint: str = Field(..., description="Token mint address to buy")
-    amount_sol: float = Field(..., gt=0, description="Amount of SOL to spend")
+    amount: Optional[float] = Field(None, gt=0, description="Amount of spend asset to use")
+    amount_sol: Optional[float] = Field(None, gt=0, description="Deprecated SOL amount field (backward-compatible)")
+    spend_denom: str = Field("SOL", description="Spend denomination: SOL or USDC")
     slippage_bps: Optional[int] = Field(None, gt=0, le=500, description="Slippage in basis points (max 500 = 5%)")
     speed_mode: Optional[str] = Field(None, description="ULTRA_FAST, BALANCED, or SAFE")
 
@@ -105,16 +107,26 @@ class ApiServer:
         @self.app.post("/buy")
         async def buy_token(request: BuyRequest):
             """
-            Buy tokens with SOL via Jupiter Aggregator.
+            Buy tokens using SOL or USDC via Jupiter Aggregator.
             
             Ultra-low latency execution with configurable speed mode.
             """
             try:
                 logger.info(f"API: BUY request for {request.mint}")
+                if request.amount is not None and request.amount_sol is not None:
+                    if abs(float(request.amount) - float(request.amount_sol)) > 1e-12:
+                        raise HTTPException(status_code=400, detail="amount and amount_sol mismatch")
+                buy_amount = request.amount if request.amount is not None else request.amount_sol
+                if buy_amount is None:
+                    raise HTTPException(status_code=400, detail="amount is required (or legacy amount_sol)")
+                spend_denom = str(request.spend_denom or "SOL").strip().upper()
+                if spend_denom not in {"SOL", "USDC"}:
+                    raise HTTPException(status_code=400, detail="spend_denom must be SOL or USDC")
                 
                 result = await self.trading_engine.buy(
                     mint=request.mint,
-                    amount_sol=request.amount_sol,
+                    amount=float(buy_amount),
+                    spend_denom=spend_denom,
                     slippage_bps=request.slippage_bps,
                     speed_mode=request.speed_mode
                 )
