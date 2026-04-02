@@ -43,7 +43,7 @@ class FakeRpcClient:
         mint_data[44] = 6
         return SimpleNamespace(value=SimpleNamespace(data=bytes(mint_data)))
 
-    async def get_signature_statuses(self, signatures):
+    async def get_signature_statuses(self, signatures, search_transaction_history=False):
         self.status_calls += 1
         if self.status_calls == 1:
             status = SimpleNamespace(confirmation_status="processed", err=None)
@@ -120,6 +120,8 @@ async def test_confirm_transaction_with_mocked_statuses(monkeypatch):
         return None
 
     monkeypatch.setattr("core.wallet_client.asyncio.sleep", fast_sleep)
-    confirmed = await wallet.confirm_transaction("sig-test", timeout=2)
+    confirmed = await wallet.confirm_transaction(
+        "3AvTFgH4e6mEzDJybsVDPen8ZcqJiWa5VaRh5bAkZpBhAsagkj23KyEZsnog6TvmiPaMxLANuTmKj7CygoDvhXSU",
+        timeout=2,
+    )
     assert confirmed is True
-

@@ -41,7 +41,13 @@ class FakeWallet:
         # return unique signature per call
         return f"sig-{self.send_calls}"
 
-    async def confirm_transaction(self, signature, timeout=60):
+    async def confirm_transaction(
+        self,
+        signature,
+        timeout=60,
+        poll_interval=1.0,
+        history_search_after_sec=12,
+    ):
         self.confirm_calls += 1
         if not self.confirm_responses:
             return True
@@ -68,7 +74,13 @@ class FakeWallet:
 
 
 class FakeWalletReconcileBuy(FakeWallet):
-    async def confirm_transaction(self, signature, timeout=60):
+    async def confirm_transaction(
+        self,
+        signature,
+        timeout=60,
+        poll_interval=1.0,
+        history_search_after_sec=12,
+    ):
         self.confirm_calls += 1
         # Simulate a tx that lands on-chain while confirmation endpoint times out.
         self.token_balance = 123_000
@@ -76,7 +88,13 @@ class FakeWalletReconcileBuy(FakeWallet):
 
 
 class FakeWalletReconcileSell(FakeWallet):
-    async def confirm_transaction(self, signature, timeout=60):
+    async def confirm_transaction(
+        self,
+        signature,
+        timeout=60,
+        poll_interval=1.0,
+        history_search_after_sec=12,
+    ):
         self.confirm_calls += 1
         # Simulate a tx that lands on-chain while confirmation endpoint times out.
         self.token_balance = 0
@@ -170,8 +188,8 @@ async def test_calculate_dynamic_slippage_fallback_on_quote_failure():
 
 
 @pytest.mark.asyncio
-async def test_buy_retries_on_timeout_then_succeeds(monkeypatch):
-    # First confirmation returns False (treated as timeout), second True
+async def test_buy_uses_grace_confirmation_before_retry(monkeypatch):
+    # First confirmation pass fails, grace pass succeeds.
     wallet = FakeWallet(confirm_responses=[False, True])
     engine = TradingEngine(wallet)
     engine.jupiter = FakeJupiter(
@@ -185,7 +203,8 @@ async def test_buy_retries_on_timeout_then_succeeds(monkeypatch):
     result = await engine.buy(mint=TEST_TOKEN_MINT, amount_sol=0.1, max_retries=3)
 
     assert result["success"] is True
-    assert result["attempts"] == 2
+    assert result["attempts"] == 1
+    assert wallet.send_calls == 1
     assert wallet.confirm_calls == 2
     assert wallet.clear_calls >= 1
 

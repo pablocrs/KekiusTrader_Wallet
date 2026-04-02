@@ -525,14 +525,39 @@ class TradingEngine:
 
         task.add_done_callback(_done_callback)
     
-    async def _wait_for_confirmation(self, signature: str, timeout: int = 30) -> bool:
+    async def _wait_for_confirmation(self, signature: str, timeout: Optional[int] = None) -> bool:
         """Wait for transaction confirmation with timeout"""
         try:
-            confirmed = await self.wallet.confirm_transaction(signature, timeout=timeout)
+            effective_timeout = int(timeout if timeout is not None else settings.TX_CONFIRM_TIMEOUT_SEC)
+            poll_interval = float(settings.TX_CONFIRM_POLL_INTERVAL_SEC)
+            history_after_sec = int(settings.TX_CONFIRM_HISTORY_AFTER_SEC)
+
+            confirmed = await self.wallet.confirm_transaction(
+                signature,
+                timeout=effective_timeout,
+                poll_interval=poll_interval,
+                history_search_after_sec=history_after_sec,
+            )
             if confirmed:
                 return True
-            
-            # Treat lack of confirmation as timeout to trigger retry
+
+            grace_timeout = int(settings.TX_CONFIRM_GRACE_TIMEOUT_SEC)
+            if grace_timeout > 0:
+                logger.warning(
+                    f"Primary confirmation window elapsed for {signature}; "
+                    f"entering grace confirmation ({grace_timeout}s with history lookup)"
+                )
+                confirmed = await self.wallet.confirm_transaction(
+                    signature,
+                    timeout=grace_timeout,
+                    poll_interval=poll_interval,
+                    history_search_after_sec=0,
+                )
+                if confirmed:
+                    logger.info(f"✅ Transaction confirmed during grace window: {signature}")
+                    return True
+
+            # Treat lack of confirmation as timeout to trigger reconciliation/retry
             raise asyncio.TimeoutError("Transaction not confirmed within timeout")
         except asyncio.TimeoutError as e:
             logger.warning(f"⏱️ Confirmation timeout for {signature}: {e}")
@@ -569,11 +594,26 @@ class TradingEngine:
         if not self._is_reconciliation_candidate(error):
             return None
 
-        await asyncio.sleep(1.0)
-        after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
-        token_delta = after_token_balance - before_token_balance
+        max_polls = max(1, int(settings.RECONCILIATION_MAX_POLLS))
+        poll_interval = max(0.1, float(settings.RECONCILIATION_POLL_INTERVAL_SEC))
+        after_sol_balance = before_sol_balance if before_sol_balance is not None else 0.0
+        after_token_balance = before_token_balance
+        token_delta = 0
+        polls_used = 0
+
+        for poll in range(max_polls):
+            if poll > 0:
+                await asyncio.sleep(poll_interval)
+            polls_used = poll + 1
+            after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
+            token_delta = after_token_balance - before_token_balance
+            if token_delta > 0:
+                break
 
         if token_delta <= 0:
+            logger.debug(
+                f"BUY reconciliation exhausted ({max_polls} polls) with no token delta for {mint}"
+            )
             return None
 
         sol_spent = 0.0
@@ -598,6 +638,7 @@ class TradingEngine:
             "reconciliation": {
                 "token_delta": token_delta,
                 "sol_spent": sol_spent,
+                "polls_used": polls_used,
             },
         }
 
@@ -620,10 +661,25 @@ class TradingEngine:
         if not self._is_reconciliation_candidate(error):
             return None
 
-        await asyncio.sleep(1.0)
-        after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
-        token_delta = max(0, before_token_balance - after_token_balance)
+        max_polls = max(1, int(settings.RECONCILIATION_MAX_POLLS))
+        poll_interval = max(0.1, float(settings.RECONCILIATION_POLL_INTERVAL_SEC))
+        after_sol_balance = before_sol_balance if before_sol_balance is not None else 0.0
+        after_token_balance = before_token_balance
+        token_delta = 0
+        polls_used = 0
+
+        for poll in range(max_polls):
+            if poll > 0:
+                await asyncio.sleep(poll_interval)
+            polls_used = poll + 1
+            after_sol_balance, after_token_balance = await self._get_fresh_route_balances(mint)
+            token_delta = max(0, before_token_balance - after_token_balance)
+            if token_delta > 0:
+                break
         if token_delta <= 0:
+            logger.debug(
+                f"SELL reconciliation exhausted ({max_polls} polls) with no token delta for {mint}"
+            )
             return None
 
         sol_gained = 0.0
@@ -648,6 +704,7 @@ class TradingEngine:
             "reconciliation": {
                 "token_delta": token_delta,
                 "sold_amount_requested": amount,
+                "polls_used": polls_used,
             },
         }
     

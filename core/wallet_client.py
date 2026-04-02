@@ -608,7 +608,9 @@ class WalletClient:
     async def confirm_transaction(
         self,
         signature: str,
-        timeout: int = 60
+        timeout: int = 60,
+        poll_interval: float = 1.0,
+        history_search_after_sec: int = 12,
     ) -> bool:
         """
         Wait for transaction confirmation.
@@ -616,6 +618,8 @@ class WalletClient:
         Args:
             signature: Transaction signature
             timeout: Timeout in seconds
+            poll_interval: Poll cadence in seconds
+            history_search_after_sec: Enable search_transaction_history after this many seconds
         
         Returns:
             True if confirmed, False otherwise
@@ -625,10 +629,20 @@ class WalletClient:
             
             loop = asyncio.get_running_loop()
             start_time = loop.time()
+            poll_delay = max(0.1, float(poll_interval))
             
             while loop.time() - start_time < timeout:
                 signature_obj = Signature.from_string(signature)
-                response = await self.client.get_signature_statuses([signature_obj])
+                elapsed = loop.time() - start_time
+                search_history = int(history_search_after_sec) <= 0 or elapsed >= int(history_search_after_sec)
+                try:
+                    response = await self.client.get_signature_statuses(
+                        [signature_obj],
+                        search_transaction_history=search_history,
+                    )
+                except TypeError:
+                    # Compatibility fallback for mocked/older RPC client signatures.
+                    response = await self.client.get_signature_statuses([signature_obj])
                 
                 if response.value and response.value[0]:
                     status = response.value[0]
@@ -640,7 +654,7 @@ class WalletClient:
                         logger.error(f"❌ Transaction failed: {status.err}")
                         return False
                 
-                await asyncio.sleep(1)
+                await asyncio.sleep(poll_delay)
             
             logger.warning(f"⏱️ Transaction confirmation timeout: {signature}")
             return False

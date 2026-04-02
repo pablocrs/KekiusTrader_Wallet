@@ -111,6 +111,15 @@ def test_buy_with_usdc_amount_routes_denom(api_client):
     assert engine.last_buy_kwargs["spend_denom"] == "USDC"
 
 
+def test_buy_with_amount_only_defaults_to_sol(api_client):
+    client, engine = api_client
+    payload = {"mint": "SomeMint", "amount": 0.1}
+    response = client.post("/buy", json=payload)
+    assert response.status_code == 200
+    assert engine.last_buy_kwargs["amount"] == 0.1
+    assert engine.last_buy_kwargs["spend_denom"] == "SOL"
+
+
 def test_buy_missing_amount_returns_400(api_client):
     client, _ = api_client
     payload = {"mint": "SomeMint", "spend_denom": "USDC"}

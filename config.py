@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     WALLET_BALANCE_CACHE_TTL: int = 20    # seconds
     TOKEN_ACCOUNTS_CACHE_TTL: int = 30    # seconds
     RPC_RATE_LIMIT_COOLDOWN_SEC: int = 45 # seconds
+    TX_CONFIRM_TIMEOUT_SEC: int = 30
+    TX_CONFIRM_GRACE_TIMEOUT_SEC: int = 20
+    TX_CONFIRM_POLL_INTERVAL_SEC: float = 1.0
+    TX_CONFIRM_HISTORY_AFTER_SEC: int = 12
+    RECONCILIATION_MAX_POLLS: int = 5
+    RECONCILIATION_POLL_INTERVAL_SEC: float = 1.5
 
     # Monitoring
     ENABLE_WEBSOCKET_BROADCAST: bool = True
